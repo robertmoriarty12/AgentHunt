@@ -9,10 +9,11 @@ AgentHunt helps security teams identify, track, and respond to malicious email a
 ## 📦 Structure
 
 Each skill is defined in a modular YAML format with the following fields:
-- `Name`: Unique internal identifier.
-- `DisplayName`: User-friendly title.
-- `Description`: Overview of the detection/hunting scenario.
-- `Settings`: Deployment settings including tenant, subscription, workspace, and the KQL `Template`.
+
+- `Name`: Unique internal identifier  
+- `DisplayName`: User-friendly title  
+- `Description`: Overview of the detection/hunting scenario  
+- `Settings`: Deployment settings including tenant, subscription, workspace, and the KQL `Template`
 
 ## 📁 Directory Layout
 
@@ -25,7 +26,7 @@ AgentHunt/
 ├── README.md # Project overview
 └── requirements.txt # (Optional) for automation or tooling
 
-sql
+markdown
 Copy
 Edit
 
@@ -41,50 +42,27 @@ To deploy a skill:
 
 2. Import the skill into your Security Copilot plugin setup.
 
-3. Use the skill in natural language within Security Copilot, such as:
-   > "Show me the top 10 malicious URL domains from the last 30 days."
+3. Use the skill in natural language within Security Copilot:
 
-📌 Requirements
-Microsoft Sentinel
+> "Show me the top 10 malicious URL domains from the last 30 days."
 
-Defender for Office 365 with email telemetry
+## 📌 Requirements
 
-Security Copilot with plugin support
+- Microsoft Sentinel  
+- Defender for Office 365 with email telemetry  
+- Security Copilot with plugin support  
+- Azure Log Analytics Workspace  
 
-Azure Log Analytics Workspace
+## 🛡 Use Cases
 
-🛡 Use Cases
-Identify top malicious email senders
+- Identify top malicious email senders  
+- Track users who clicked phishing URLs  
+- Detect spoofing attempts with failed authentication  
+- Monitor policy-based overrides (admin/user)  
+- Spot targeted users or campaigns  
 
-Track users who clicked phishing URLs
+## 📫 Feedback
 
-Detect spoofing attempts with failed authentication
-
-Monitor policy-based overrides (admin/user)
-
-Spot targeted users or campaigns
-
-📫 Feedback
 Contributions or suggestions? Open an issue or reach out via GitHub.
 
 © 2025 Robert Moriarty — Built for real-world defenders.
-
-## 🧠 Example Skill
-
-```yaml
-- Name: AgentHuntZeroDayThreats
-  DisplayName: "AgentHunt - Zero Day Threats"
-  Description: Reviews the count of zero day threats detected via URL and file detonations in Defender for Office 365 over the past 30 days.
-  Settings:
-    Target: Sentinel
-    TenantId: "<YOUR_TENANT_ID>"
-    SubscriptionId: "<YOUR_SUBSCRIPTION_ID>"
-    ResourceGroupName: "<YOUR_RESOURCE_GROUP_NAME>"
-    WorkspaceName: "<YOUR_WORKSPACE_NAME>"
-    Template: |-
-      EmailEvents 
-      | where Timestamp > ago(30d) 
-      | where DetectionMethods has "URL Detonation" or DetectionMethods has "File Detonation" 
-      | count
-
-

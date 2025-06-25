@@ -44,23 +44,6 @@ To deploy a skill:
 3. Use the skill in natural language within Security Copilot, such as:
    > "Show me the top 10 malicious URL domains from the last 30 days."
 
-## 🧠 Example Skill
-
-```yaml
-- Name: AgentHuntZeroDayThreats
-  DisplayName: "AgentHunt - Zero Day Threats"
-  Description: Reviews the count of zero day threats detected via URL and file detonations in Defender for Office 365 over the past 30 days.
-  Settings:
-    Target: Sentinel
-    TenantId: "<YOUR_TENANT_ID>"
-    SubscriptionId: "<YOUR_SUBSCRIPTION_ID>"
-    ResourceGroupName: "<YOUR_RESOURCE_GROUP_NAME>"
-    WorkspaceName: "<YOUR_WORKSPACE_NAME>"
-    Template: |-
-      EmailEvents 
-      | where Timestamp > ago(30d) 
-      | where DetectionMethods has "URL Detonation" or DetectionMethods has "File Detonation" 
-      | count
 📌 Requirements
 Microsoft Sentinel
 
@@ -85,3 +68,23 @@ Spot targeted users or campaigns
 Contributions or suggestions? Open an issue or reach out via GitHub.
 
 © 2025 Robert Moriarty — Built for real-world defenders.
+
+## 🧠 Example Skill
+
+```yaml
+- Name: AgentHuntZeroDayThreats
+  DisplayName: "AgentHunt - Zero Day Threats"
+  Description: Reviews the count of zero day threats detected via URL and file detonations in Defender for Office 365 over the past 30 days.
+  Settings:
+    Target: Sentinel
+    TenantId: "<YOUR_TENANT_ID>"
+    SubscriptionId: "<YOUR_SUBSCRIPTION_ID>"
+    ResourceGroupName: "<YOUR_RESOURCE_GROUP_NAME>"
+    WorkspaceName: "<YOUR_WORKSPACE_NAME>"
+    Template: |-
+      EmailEvents 
+      | where Timestamp > ago(30d) 
+      | where DetectionMethods has "URL Detonation" or DetectionMethods has "File Detonation" 
+      | count
+
+

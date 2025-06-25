@@ -1,0 +1,78 @@
+Descriptor:
+  Name: AgentHunt.SentinelTestLabQueries
+  DisplayName: "AgentHunt - Sentinel Test Lab Queries"
+  Description: A collection of KQL skills to identify advanced threats in test lab Sentinel environments, including Solorigate pipe detection and OAuth credential misuse.
+SkillGroups:
+  - Format: KQL
+    Skills:
+      - Name: AgentHuntSolorigatePipeDetection
+        DisplayName: "AgentHunt - Solorigate Named Pipe Activity"
+        Description: Identifies execution of adversary-controlled code related to Solorigate via named pipe usage (`583da945-62af-10e8-4902-a8f205c72b2e`) from Sysmon and Security Event logs.
+        Settings:
+          Target: Sentinel
+          TenantId: "<YOUR_TENANT_ID>"
+          SubscriptionId: "<YOUR_SUBSCRIPTION_ID>"
+          ResourceGroupName: "<YOUR_RESOURCE_GROUP_NAME>"
+          WorkspaceName: "<YOUR_WORKSPACE_NAME>"
+          Template: |-
+            let timeframe = 1d;
+            (union isfuzzy=true
+              (
+                Event
+                | where TimeGenerated >= ago(timeframe)
+                | where Source == "Microsoft-Windows-Sysmon"
+                | where EventID in (17,18)
+                | extend EvData = parse_xml(EventData)
+                | extend EventDetail = EvData.DataItem.EventData.Data
+                | extend NamedPipe = EventDetail.[5].["#text"]
+                | extend ProcessDetail = EventDetail.[6].["#text"]
+                | where NamedPipe contains '583da945-62af-10e8-4902-a8f205c72b2e'
+                | extend Account = UserName
+                | project-away EventDetail, EvData
+              ),
+              (
+                SecurityEvent_CL
+                | where TimeGenerated >= ago(timeframe)
+                | where EventID_s == '5145'
+                | where AccessList_s has '%%4418'
+                | where RelativeTargetName_g contains '583da945-62af-10e8-4902-a8f205c72b2e'
+              )
+            )
+            | extend timestamp = TimeGenerated, AccountCustomEntity = Account_s, HostCustomEntity = Computer
+
+      - Name: AgentHuntOAuthKeyCredentialAdditions
+        DisplayName: "AgentHunt - OAuth App Key Credential Addition"
+        Description: Flags successful additions of new credentials to applications or service principals by examining audit logs for modifications involving key credentials.
+        Settings:
+          Target: Sentinel
+          TenantId: "<YOUR_TENANT_ID>"
+          SubscriptionId: "<YOUR_SUBSCRIPTION_ID>"
+          ResourceGroupName: "<YOUR_RESOURCE_GROUP_NAME>"
+          WorkspaceName: "<YOUR_WORKSPACE_NAME>"
+          Template: |-
+            AuditLogs_CL
+            | where OperationName has_any ("Add service principal", "Certificates and secrets management")
+            | where Result_s =~ "success"
+            | mv-expand target = todynamic(TargetResources_s )
+            | where tostring(tostring(parse_json(tostring(parse_json(InitiatedBy_s).user)).userPrincipalName)) has "@" or tostring(parse_json(InitiatedBy_s).displayName) has "@"
+            | extend targetDisplayName = tostring(parse_json(TargetResources_s)[0].displayName)
+            | extend targetId = tostring(parse_json(TargetResources_s)[0].id)
+            | extend targetType = tostring(parse_json(TargetResources_s)[0].type)
+            | extend eventtemp = todynamic(TargetResources_s)
+            | extend keyEvents = eventtemp[0].modifiedProperties
+            | mv-expand keyEvents
+            | where keyEvents.displayName =~ "KeyDescription"
+            | extend set1 = parse_json(tostring(keyEvents.newValue))
+            | extend set2 = parse_json(tostring(keyEvents.oldValue))
+            | extend diff = set_difference(set1, set2)
+            | where isnotempty(diff)
+            | parse diff with * "KeyIdentifier=" keyIdentifier: string ",KeyType=" keyType: string ",KeyUsage=" keyUsage: string ",DisplayName=" keyDisplayName: string "]" *
+            | where keyUsage == "Verify" or keyUsage == ""
+            | extend AdditionalDetailsttemp = todynamic(AdditionalDetails_s)
+            | extend UserAgent = iff(todynamic(AdditionalDetailsttemp[0]).key == "User-Agent", tostring(AdditionalDetailsttemp[0].value), "")
+            | extend InitiatedByttemp = todynamic(InitiatedBy_s)
+            | extend InitiatingUserOrApp = iff(isnotempty(InitiatedByttemp.user.userPrincipalName), tostring(InitiatedByttemp.user.userPrincipalName), tostring(InitiatedByttemp.app.displayName))
+            | extend InitiatingIpAddress = iff(isnotempty(InitiatedByttemp.user.ipAddress), tostring(InitiatedByttemp.user.ipAddress), tostring(InitiatedByttemp.app.ipAddress))
+            | project-away diff, set1, set2 , eventtemp ,AdditionalDetailsttemp, InitiatedByttemp
+            | project-reorder TimeGenerated, OperationName,InitiatingUserOrApp,InitiatingIpAddress,UserAgent,targetDisplayName,targetId,targetType,keyDisplayName,keyType,keyUsage,keyIdentifier,CorrelationId
+            | extend timestamp = TimeGenerated, AccountCustomEntity = InitiatingUserOrApp, IPCustomEntity = InitiatingIpAddress

@@ -1,0 +1,19 @@
+Descriptor:
+  Name: Agent Hunt - Template
+  DisplayName: "Template"
+  Description: Description of query for orchestrator.
+SkillGroups:
+  - Format: KQL
+    Skills:
+      - Name: TestUsageSkill
+        DisplayName: Test Usage Skill
+        Description: Checks plugin registration with the Usage table.
+        Settings:
+          Target: Sentinel
+          TenantId: "<YOUR_TENANT_ID_HERE>"
+          SubscriptionId: "<YOUR_SUBSCRIPTION_ID_HERE>"
+          ResourceGroupName: "<YOUR_RESOURCE_GROUP_NAME>"
+          WorkspaceName: "<YOUR_WORKSPACE_NAME>"
+          Template: |-
+            Usage
+            | take 1

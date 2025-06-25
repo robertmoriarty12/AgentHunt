@@ -1,0 +1,1522 @@
+Descriptor:
+  Name: AgentHunt.XDR.MDO
+  DisplayName: "AgentHunt - Defender XDR & MDO Threat Hunts"
+  Description: KQL skills for identifying suspicious activity and misconfigurations in Microsoft Defender XDR and Microsoft Defender for Office 365.
+SkillGroups:
+  - Format: KQL
+    Skills:
+      - Name: AgentHuntAdminOverridesInEmail
+        DisplayName: "AgentHunt - Admin Overrides in Email Delivery"
+        Description: Identifies malicious emails delivered to user inboxes due to administrative allow actions. Useful for reviewing bypassed detections.
+        Settings:
+          Target: Sentinel
+          TenantId: "<YOUR_TENANT_ID>"
+          SubscriptionId: "<YOUR_SUBSCRIPTION_ID>"
+          ResourceGroupName: "<YOUR_RESOURCE_GROUP_NAME>"
+          WorkspaceName: "<YOUR_WORKSPACE_NAME>"
+          Template: |-
+            EmailEvents
+            | where DeliveryLocation == "Inbox/folder"
+            | where isnotempty(ThreatTypes) and OrgLevelAction == "Allow"
+            | count
+
+      - Name: AgentHuntAppspotPhishingAbuse
+        DisplayName: "AgentHunt - Appspot Phishing Abuse Detection"
+        Description: Detects phishing campaigns abusing Appspot domains and targeting recipients by embedding their email address in the URL.
+        Settings:
+          Target: Sentinel
+          TenantId: "<YOUR_TENANT_ID>"
+          SubscriptionId: "<YOUR_SUBSCRIPTION_ID>"
+          ResourceGroupName: "<YOUR_RESOURCE_GROUP_NAME>"
+          WorkspaceName: "<YOUR_WORKSPACE_NAME>"
+          Template: |-
+            EmailUrlInfo
+            // Detect URLs with a subdomain on appspot.com
+            | where UrlDomain matches regex @'\b[\w\-]+-dot-[\w\-\.]+\.appspot\.com\b'
+            // Enrich results with sender and recipient data
+            | join kind=inner EmailEvents on $left.NetworkMessageId==$right.NetworkMessageId
+            // Phishing attempts from Appspot related campaigns typically contain the recipient's email address in the URI
+            | where Url has RecipientEmailAddress
+                or Url has base64_encode_tostring(RecipientEmailAddress)
+            | project-away Timestamp1, NetworkMessageId1, ReportId1
+
+      - Name: AgentHuntHighTargetEmailAccounts
+        DisplayName: "AgentHunt - High Volume Targeted Email Accounts"
+        Description: Identifies email recipients who have been targeted more than X times the average, indicating potential high-value targets.
+        Settings:
+          Target: Sentinel
+          TenantId: "<YOUR_TENANT_ID>"
+          SubscriptionId: "<YOUR_SUBSCRIPTION_ID>"
+          ResourceGroupName: "<YOUR_RESOURCE_GROUP_NAME>"
+          WorkspaceName: "<YOUR_WORKSPACE_NAME>"
+          Template: |-
+            let AverageThreatPerRecipient = toscalar(
+              EmailEvents 
+              | where DetectionMethods != "" 
+              | summarize total=count() by RecipientEmailAddress 
+              | summarize avg(total)
+            ); 
+            EmailEvents 
+            | where DetectionMethods != "" 
+            | summarize total=count() by RecipientEmailAddress 
+            | where tolong(total) >= 1 * AverageThreatPerRecipient // update "1" to desired threshold multiplier
+
+      - Name: AgentHuntEmailAuthFailures
+        DisplayName: "AgentHunt - Email Authentication Failures Over Time"
+        Description: Reviews authentication failures by type (e.g., DMARC, DKIM, SPF, CompAuth) over a 30-day period.
+        Settings:
+          Target: Sentinel
+          TenantId: "<YOUR_TENANT_ID>"
+          SubscriptionId: "<YOUR_SUBSCRIPTION_ID>"
+          ResourceGroupName: "<YOUR_RESOURCE_GROUP_NAME>"
+          WorkspaceName: "<YOUR_WORKSPACE_NAME>"
+          Template: |-
+            EmailEvents
+            | where Timestamp > ago(30d)
+            | project Timestamp, AR=parse_json(AuthenticationDetails), NetworkMessageId, EmailDirection, SenderFromAddress, ThreatTypes, DetectionMethods
+            | evaluate bag_unpack(AR)
+            | where DMARC == "fail"  // Change to DKIM, SPF, or CompAuth as needed
+            | summarize count() by bin(Timestamp, 1d)
+
+      - Name: AgentHuntSuspiciousEmailsAndLogins
+        DisplayName: "AgentHunt - Automated Email Notifications and Risky Sign-Ins"
+        Description: Correlates automated email notifications (e.g., from Microsoft or Dropbox) with risky sign-in activity, helping to identify accounts potentially targeted by credential phishing.
+        Settings:
+          Target: Sentinel
+          TenantId: "<YOUR_TENANT_ID>"
+          SubscriptionId: "<YOUR_SUBSCRIPTION_ID>"
+          ResourceGroupName: "<YOUR_RESOURCE_GROUP_NAME>"
+          WorkspaceName: "<YOUR_WORKSPACE_NAME>"
+          Template: |-
+            let usersWithSuspiciousEmails = EmailEvents
+            | where SenderFromAddress in ("no-reply@notify.microsoft.com", "no-reply@dropbox.com") or InternetMessageId startswith "<OneTimePasscode"
+            | where isnotempty(RecipientObjectId)
+            | distinct RecipientObjectId;
+            AADSignInEventsBeta
+            | where AccountObjectId in (usersWithSuspiciousEmails)
+            | where RiskLevelDuringSignIn == 100
+
+      - Name: AgentHuntRandomAttachmentCampaign
+        DisplayName: "AgentHunt - Campaign with Randomly Named Attachments"
+        Description: Detects suspicious email campaigns where a sender sends image attachments with randomized filenames to many recipients, indicating potential phishing or malware delivery.
+        Settings:
+          Target: Sentinel
+          TenantId: "<YOUR_TENANT_ID>"
+          SubscriptionId: "<YOUR_SUBSCRIPTION_ID>"
+          ResourceGroupName: "<YOUR_RESOURCE_GROUP_NAME>"
+          WorkspaceName: "<YOUR_WORKSPACE_NAME>"
+          Template: |-
+            EmailAttachmentInfo
+            | where Timestamp > ago(7d)
+            | where FileType in ("png", "jpg", "jpeg", "gif", "svg")
+            | where isnotempty(FileName)
+            | extend firstFourFileName = substring(FileName, 0, 4)
+            | summarize RecipientsCount = dcount(RecipientEmailAddress), 
+                        FirstFourFilesCount = dcount(firstFourFileName), 
+                        suspiciousEmails = make_set(NetworkMessageId, 10) 
+              by SenderFromAddress
+            | where FirstFourFilesCount >= 10
+
+      - Name: AgentHuntSuspiciousKeywordCampaign
+        DisplayName: "AgentHunt - Campaign with Suspicious Keywords"
+        Description: Flags inbound emails containing suspicious phishing-related keywords in the subject line and lacking an associated sender object, suggesting spoofing or phishing.
+        Settings:
+          Target: Sentinel
+          TenantId: "<YOUR_TENANT_ID>"
+          SubscriptionId: "<YOUR_SUBSCRIPTION_ID>"
+          ResourceGroupName: "<YOUR_RESOURCE_GROUP_NAME>"
+          WorkspaceName: "<YOUR_WORKSPACE_NAME>"
+          Template: |-
+            let PhishingKeywords = ()
+            {
+              pack_array("account", "alert", "bank", "billing", "card", "change", "confirmation",
+                         "login", "password", "mfa", "authorize", "authenticate", "payment", "urgent", "verify", "blocked");
+            };
+            EmailEvents
+            | where Timestamp > ago(1d)
+            | where EmailDirection == "Inbound"
+            | where DeliveryAction == "Delivered"
+            | where isempty(SenderObjectId)
+            | where Subject has_any (PhishingKeywords())
+
+      - Name: AgentHuntQRFromNonPrevalentSenders
+        DisplayName: "AgentHunt - Emails with QR from Non-Prevalent Senders"
+        Description: Detects emails containing QR codes sent by non-prevalent senders within the organization, potentially indicating malicious campaigns.
+        Settings:
+          Target: Sentinel
+          TenantId: "<YOUR_TENANT_ID>"
+          SubscriptionId: "<YOUR_SUBSCRIPTION_ID>"
+          ResourceGroupName: "<YOUR_RESOURCE_GROUP_NAME>"
+          WorkspaceName: "<YOUR_WORKSPACE_NAME>"
+          Template: |-
+            let QRCode_emails = EmailUrlInfo
+            | where Timestamp > ago (2d)
+            | where UrlLocation == "QRCode"
+            | distinct Url, NetworkMessageId;
+            let nMIDs = QRCode_emails | distinct NetworkMessageId;
+            let senders_NMIDs = EmailEvents
+            | where Timestamp > ago (2d)
+            | where DeliveryAction != "Blocked"
+            | where isnotempty(NetworkMessageId)
+            | where NetworkMessageId in (nMIDs)
+            | distinct Timestamp, NetworkMessageId, RecipientEmailAddress, SenderFromAddress, InternetMessageId, RecipientObjectId, ReportId;
+            let senders = senders_NMIDs | distinct SenderFromAddress;
+            let senderprevalence = EmailEvents
+            | where Timestamp between (ago(14d)..(now()-24h))
+            | where isnotempty(SenderFromAddress)
+            | where SenderFromAddress in (senders)
+            | summarize TotalEmailCount = count() by SenderFromAddress
+            | where TotalEmailCount > 1;
+            let prevalent_Sender = senderprevalence | distinct SenderFromAddress;
+            let nMIDs_from_non_prevalent_Senders = senders_NMIDs
+            | where SenderFromAddress !in (prevalent_Sender)
+            | distinct NetworkMessageId;
+            let QRCode_emails_from_non_prevalent_senders = QRCode_emails
+            | where NetworkMessageId in (nMIDs_from_non_prevalent_Senders)
+            | join kind=inner senders_NMIDs on NetworkMessageId
+            | project Timestamp, Url, NetworkMessageId, InternetMessageId, RecipientObjectId, RecipientEmailAddress, ReportId;
+            QRCode_emails_from_non_prevalent_senders
+
+      - Name: AgentHuntDetectionsByMethod
+        DisplayName: "AgentHunt - Email Detections by Method"
+        Description: Summarizes malicious email detections by detection methods in Microsoft Defender XDR over the past 7 days.
+        Settings:
+          Target: Sentinel
+          TenantId: "<YOUR_TENANT_ID>"
+          SubscriptionId: "<YOUR_SUBSCRIPTION_ID>"
+          ResourceGroupName: "<YOUR_RESOURCE_GROUP_NAME>"
+          WorkspaceName: "<YOUR_WORKSPACE_NAME>"
+          Template: |-
+            EmailEvents
+            | where Timestamp > ago(7d)
+            | where isnotempty(DetectionMethods)
+            | extend MDO_detection = parse_json(DetectionMethods)
+            | summarize TotalEmailCount = count(),
+                        Phish_detection = countif(isnotempty(MDO_detection.Phish)),
+                        Malware_detection = countif(isnotempty(MDO_detection.Malware)),
+                        Spam_detection = countif(isnotempty(MDO_detection.Spam)),
+                        URL_malicious_reputation = countif(MDO_detection.Phish == @'["URL malicious reputation"]' or MDO_detection.Malware == @'["URL malicious reputation"]'),
+                        URL_detonation_reputation = countif(MDO_detection.Phish == @'["URL detonation reputation"]' or MDO_detection.Malware == @'["URL detonation reputation"]'),
+                        URL_detonation = countif(MDO_detection.Phish == @'["URL detonation"]' or MDO_detection.Malware == @'["URL detonation"]'),
+                        Advanced_filter = countif(MDO_detection.Phish == @'["Advanced filter"]'),
+                        General_filter = countif(MDO_detection.Phish == @'["General filter"]'),
+                        Spoof_intra_org = countif(MDO_detection.Phish == @'["Spoof intra-org"]'),
+                        Spoof_external_domain = countif(MDO_detection.Phish == @'["Spoof external domain"]'),
+                        Spoof_DMARC = countif(MDO_detection.Phish == @'["Spoof DMARC"]'),
+                        Impersonation_brand = countif(MDO_detection.Phish == @'["Impersonation brand"]'),
+                        Impersonation_user = countif(MDO_detection.Phish == @'["Impersonation user"]'),
+                        Impersonation_domain = countif(MDO_detection.Phish == @'["Impersonation domain"]'),
+                        Mixed_analysis_detection = countif(MDO_detection.Phish == @'["Mixed analysis detection"]'),
+                        File_reputation = countif(MDO_detection.Phish == @'["File reputation"]' or MDO_detection.Malware == @'["File reputation"]'),
+                        File_detonation = countif(MDO_detection.Phish == @'["File detonation"]' or MDO_detection.Malware == @'["File detonation"]'),
+                        File_detonation_reputation = countif(MDO_detection.Phish == @'["File detonation reputation"]' or MDO_detection.Malware == @'["File detonation reputation"]'),
+                        Antimalware_engine = countif(MDO_detection.Malware == @'["Antimalware engine"]'),
+                        Fingerprint_matching = countif(MDO_detection.Phish == @'["Fingerprint matching"]'), 
+                        Mailbox_intelligence_impersonation = countif(MDO_detection.Phish == @'["Mailbox intelligence impersonation"]'),
+                        Campaign = countif(MDO_detection.Phish == @'["Campaign"]' or MDO_detection.Malware == @'["Campaign"]') by bin(Timestamp, 1d)
+            | project Timestamp, TotalEmailCount, Phish_detection, Malware_detection, Spam_detection,
+                      URL_malicious_reputation, URL_detonation_reputation, URL_detonation, Advanced_filter, General_filter,
+                      Spoof_intra_org, Spoof_external_domain, Spoof_DMARC, Impersonation_brand, Impersonation_user,
+                      Impersonation_domain, Mixed_analysis_detection, File_reputation, File_detonation,
+                      File_detonation_reputation, Antimalware_engine, Fingerprint_matching,
+                      Mailbox_intelligence_impersonation, Campaign
+
+      - Name: AgentHuntDeliveredPhishByIP
+        DisplayName: "AgentHunt - Delivered Phishing Emails by IP"
+        Description: Identifies successfully delivered phishing or malware emails and attributes them to top sending IP addresses, useful for identifying high-volume threats.
+        Settings:
+          Target: Sentinel
+          TenantId: "<YOUR_TENANT_ID>"
+          SubscriptionId: "<YOUR_SUBSCRIPTION_ID>"
+          ResourceGroupName: "<YOUR_RESOURCE_GROUP_NAME>"
+          WorkspaceName: "<YOUR_WORKSPACE_NAME>"
+          Template: |-
+            // Adjust the cutoff as needed 
+            let cutoff = 5;
+            EmailEvents
+            | where ThreatTypes has "Malware" or ThreatTypes has "Phish" 
+            | summarize count() by SenderIPv4 
+            | where count_ > cutoff
+            | join kind=inner EmailEvents on SenderIPv4  
+            | where DeliveryAction =~ "Delivered"
+            | extend Name = tostring(split(SenderFromAddress, '@', 0)[0]), 
+                     UPNSuffix = tostring(split(SenderFromAddress, '@', 1)[0])
+            | extend Account_0_Name = Name,
+                     Account_0_UPNSuffix = UPNSuffix,
+                     IP_0_Address = SenderIPv4,
+                     MailBox_0_MailboxPrimaryAddress = RecipientEmailAddress
+
+      - Name: AgentHuntSpoofAndImpersonation
+        DisplayName: "AgentHunt - Spoof and Impersonation"
+        Description: Reviews delivered emails where the sender’s Display Name contains "Microsoft", indicating potential impersonation or spoofing attempts.
+        Settings:
+          Target: Sentinel
+          TenantId: "<YOUR_TENANT_ID>"
+          SubscriptionId: "<YOUR_SUBSCRIPTION_ID>"
+          ResourceGroupName: "<YOUR_RESOURCE_GROUP_NAME>"
+          WorkspaceName: "<YOUR_WORKSPACE_NAME>"
+          Template: |-
+            let emailDelivered = EmailEvents
+            | where Timestamp < ago(24hrs)
+            and DeliveryAction == "Delivered"
+            and SenderDisplayName contains "Microsoft"
+            | summarize count() by SenderFromAddress
+            | where count_ > 3
+            | project SenderFromAddress;
+            EmailEvents
+            | where Timestamp > ago(24hrs)
+            | where DeliveryAction == "Delivered"
+            and EmailDirection == "Inbound"
+            and OrgLevelAction != "Block"
+            and UserLevelAction != "Block"
+            and SenderDisplayName contains "Microsoft"
+            | extend NewMsg = case(Subject contains "RE:", false, Subject contains "FW:", false, true )
+            | project SenderDisplayName, SenderFromAddress, NetworkMessageId, SenderMailFromAddress, RecipientEmailAddress, DeliveryAction, DeliveryLocation, ThreatTypes, DetectionMethods, NewMsg, Subject
+            | join kind=leftanti ( emailDelivered ) on SenderFromAddress
+            | order by SenderMailFromAddress
+            | summarize count() by SenderDisplayName, SenderFromAddress, NetworkMessageId, SenderMailFromAddress, RecipientEmailAddress, DeliveryAction, DeliveryLocation, ThreatTypes, DetectionMethods, NewMsg, Subject
+
+      - Name: AgentHuntEmailBombingAttacks
+        DisplayName: "AgentHunt - Email Bombing Attacks"
+        Description: Reviews recipients who are potentially victims of email bombing attacks by identifying a high volume of first-contact messages in a short time window.
+        Settings:
+          Target: Sentinel
+          TenantId: "<YOUR_TENANT_ID>"
+          SubscriptionId: "<YOUR_SUBSCRIPTION_ID>"
+          ResourceGroupName: "<YOUR_RESOURCE_GROUP_NAME>"
+          WorkspaceName: "<YOUR_WORKSPACE_NAME>"
+          Template: |-
+            let Contact_Established = EmailEvents 
+            | where Timestamp <= ago(4hr)
+            | where DeliveryLocation != "Quarantine"
+            and EmailDirection == "Inbound"
+            and OrgLevelAction != "Block"
+            and UserLevelAction != "Block"
+            | extend NewMsg = case(Subject startswith "RE:", false, Subject startswith "FW:", false, true )
+            | where NewMsg == false
+            | project Pair = strcat(SenderMailFromAddress,"|",RecipientEmailAddress);
+            EmailEvents
+            | where Timestamp > ago(4hr)
+            and DeliveryAction == "Delivered"
+            | extend Pair = strcat(SenderMailFromAddress,"|",RecipientEmailAddress)
+            | where Pair !in (Contact_Established)
+            | summarize 5_Min_Count = dcount(NetworkMessageId) by RecipientEmailAddress, bin(Timestamp, 5m)
+            | where 5_Min_Count > 5
+
+      - Name: AgentHuntMalwareEmailAccessedOnUnmanagedDevice
+        DisplayName: "AgentHunt - Malware Email Accessed on Unmanaged Device"
+        Description: Identifies emails containing malware that were accessed on unmanaged devices by correlating post-delivery malware ZAP events with access events from devices without a registered name.
+        Settings:
+          Target: Sentinel
+          TenantId: "<YOUR_TENANT_ID>"
+          SubscriptionId: "<YOUR_SUBSCRIPTION_ID>"
+          ResourceGroupName: "<YOUR_RESOURCE_GROUP_NAME>"
+          WorkspaceName: "<YOUR_WORKSPACE_NAME>"
+          Template: |-
+            EmailPostDeliveryEvents
+            | where ActionType == "Malware ZAP"
+            | project NetworkMessageId,InternetMessageId,ActionType,ThreatTypes,DetectionMethods,ZAPReportId=ReportId,ZAPTimestamp=Timestamp
+            | join (
+                CloudAppEvents 
+                | where ActionType == "MailItemsAccessed"
+                | extend RawEvent=parse_json(RawEventData)
+                | mv-expand RawEvent.Folders
+                | mv-expand RawEvent_Folders.FolderItems
+                | project SessionId=tostring(RawEvent.SessionId), InternetMessageId=tostring(parse_json(RawEvent_Folders_FolderItems).InternetMessageId), ActionTimestamp=Timestamp, ActionReportId=ReportId
+            ) on InternetMessageId
+            | where isnotempty(SessionId)
+            | join (
+                AADSignInEventsBeta 
+                | where isempty(DeviceName) 
+                | distinct AccountUpn, SessionId
+            ) on SessionId
+            | project AccountUpn, NetworkMessageId, InternetMessageId, ActionType, ThreatTypes, DetectionMethods, SessionId, ReportId=ActionReportId, Timestamp=ActionTimestamp
+
+      - Name: AgentHuntInternalMalwareSender
+        DisplayName: "AgentHunt - Internal Sender of Malware Email"
+        Description: Detects emails containing malware that were sent by internal or outbound users, excluding common system senders. Joins with attachment info to enrich context.
+        Settings:
+          Target: Sentinel
+          TenantId: "<YOUR_TENANT_ID>"
+          SubscriptionId: "<YOUR_SUBSCRIPTION_ID>"
+          ResourceGroupName: "<YOUR_RESOURCE_GROUP_NAME>"
+          WorkspaceName: "<YOUR_WORKSPACE_NAME>"
+          Template: |-
+            EmailEvents
+            | where EmailDirection == "Intra-org" or EmailDirection == "Outbound"
+            | where ThreatTypes == "Malware" 
+            | where SenderFromAddress !startswith "postmaster@" and SenderFromAddress !startswith "microsoftexchange"
+            | join (
+                EmailAttachmentInfo 
+                | where isnotempty(ThreatTypes)
+            ) on NetworkMessageId
+
+      - Name: AgentHuntMalwareDetectionReport
+        DisplayName: "AgentHunt - Email Malware Detection Report"
+        Description: Reviews emails with malware detections, highlighting threat names and associated attachments for each recipient.
+        Settings:
+          Target: Sentinel
+          TenantId: "<YOUR_TENANT_ID>"
+          SubscriptionId: "<YOUR_SUBSCRIPTION_ID>"
+          ResourceGroupName: "<YOUR_RESOURCE_GROUP_NAME>"
+          WorkspaceName: "<YOUR_WORKSPACE_NAME>"
+          Template: |-
+            EmailEvents
+            | where Timestamp > ago(30d)
+            | where isnotempty(ThreatNames)
+            | join kind=inner EmailAttachmentInfo on NetworkMessageId 
+            | extend ThreatFamilyAttachment = strcat(format_datetime(Timestamp,'yyyy-M-dd H:mm:ss'), " /", ThreatNames, " /", FileName, " /", NetworkMessageId)
+            | summarize ThreatFamily_wih_Attachment = make_list(ThreatFamilyAttachment) by RecipientEmailAddress
+            | extend Case = array_length(ThreatFamily_wih_Attachment)
+            | project RecipientEmailAddress, Case, ThreatFamily_wih_Attachment 
+            | sort by Case desc
+
+      - Name: AgentHuntEmailsWithIPLinks
+        DisplayName: "AgentHunt - Emails Containing Links to IP Addresses"
+        Description: Hunts for emails that contain hyperlinks pointing directly to raw IP addresses.
+        Settings:
+          Target: Sentinel
+          TenantId: "<YOUR_TENANT_ID>"
+          SubscriptionId: "<YOUR_SUBSCRIPTION_ID>"
+          ResourceGroupName: "<YOUR_RESOURCE_GROUP_NAME>"
+          WorkspaceName: "<YOUR_WORKSPACE_NAME>"
+          Template: |-
+            EmailUrlInfo
+            | where Url matches regex @"file://(?:[0-9]{1,3}\.){3}[0-9]{1,3}"
+
+      - Name: AgentHuntQRUrlDeliveries
+        DisplayName: "AgentHunt - Delivered Emails Containing QR Code URLs"
+        Description: Identifies inbound emails that were successfully delivered and contain URLs derived from QR codes.
+        Settings:
+          Target: Sentinel
+          TenantId: "<YOUR_TENANT_ID>"
+          SubscriptionId: "<YOUR_SUBSCRIPTION_ID>"
+          ResourceGroupName: "<YOUR_RESOURCE_GROUP_NAME>"
+          WorkspaceName: "<YOUR_WORKSPACE_NAME>"
+          Template: |-
+            EmailEvents
+            | where Timestamp > ago(30d)
+            | where EmailDirection == "Inbound"
+            | where DeliveryAction == "Delivered"
+            | join EmailUrlInfo on NetworkMessageId
+            | where UrlLocation == "QRCode"
+            | project Timestamp, NetworkMessageId, SenderFromAddress, Subject, Url, UrlDomain, UrlLocation, RecipientEmailAddress
+
+      - Name: AgentHuntQRNonPrevalentSenders
+        DisplayName: "AgentHunt - Emails with QR Codes from Non-Prevalent Senders"
+        Description: Detects inbound emails with QR code URLs from senders who have not sent multiple emails in the past 7 days.
+        Settings:
+          Target: Sentinel
+          TenantId: "<YOUR_TENANT_ID>"
+          SubscriptionId: "<YOUR_SUBSCRIPTION_ID>"
+          ResourceGroupName: "<YOUR_RESOURCE_GROUP_NAME>"
+          WorkspaceName: "<YOUR_WORKSPACE_NAME>"
+          Template: |-
+            let senderprevalence =
+            EmailEvents
+            | where Timestamp between (ago(7d)..(now()-24h))
+            | where isnotempty(SenderFromAddress)
+            | summarize TotalEmailCount = dcount(NetworkMessageId) by SenderFromAddress
+            | where TotalEmailCount > 1;
+            let prevalent_Sender = senderprevalence
+            | where isnotempty(SenderFromAddress)
+            | distinct SenderFromAddress;
+            let QR_from_non_prevalent =
+            EmailEvents
+            | where EmailDirection == "Inbound"
+            | where Timestamp > ago(1d)
+            | where SenderFromAddress !in (prevalent_Sender)
+            | join EmailUrlInfo on NetworkMessageId
+            | where UrlLocation == "QRCode"
+            | distinct SenderFromAddress, Url, NetworkMessageId;
+            QR_from_non_prevalent
+
+      - Name: AgentHuntEndUserMaliciousClicks
+        DisplayName: "AgentHunt - End User Malicious Clicks"
+        Description: Reviews list of users who clicked on phishing URLs and categorizes their actions (Blocked, Allowed, Pending, Error, ClickedThrough).
+        Settings:
+          Target: Sentinel
+          TenantId: "<YOUR_TENANT_ID>"
+          SubscriptionId: "<YOUR_SUBSCRIPTION_ID>"
+          ResourceGroupName: "<YOUR_RESOURCE_GROUP_NAME>"
+          WorkspaceName: "<YOUR_WORKSPACE_NAME>"
+          Template: |-
+            UrlClickEvents
+            | where ThreatTypes contains "Phish"
+            | extend UrlBlocked = ActionType has_any("ClickBlocked")
+            | extend UrlAllowed = ActionType has_any("ClickAllowed")
+            | extend UrlPendingVerdict = ActionType has_any("UrlScanInProgress")
+            | extend ErrorPage = ActionType has_any("UrlErrorPage")
+            | summarize 
+                Blocked = countif(UrlBlocked), 
+                Allowed = countif(UrlAllowed), 
+                PendingVerdict = countif(UrlPendingVerdict), 
+                Error = countif(ErrorPage), 
+                ClickedThrough = countif(IsClickedThrough)  
+              by AccountUpn
+            | sort by Blocked desc
+
+      - Name: AgentHuntFileShareSuspiciousSignIn
+        DisplayName: "AgentHunt - Files Shared & Suspicious Sign-In"
+        Description: Detects mass file-sharing emails with sensitive subjects followed by risky sign-ins, indicating possible account compromise.
+        Settings:
+          Target: Sentinel
+          TenantId: "<YOUR_TENANT_ID>"
+          SubscriptionId: "<YOUR_SUBSCRIPTION_ID>"
+          ResourceGroupName: "<YOUR_RESOURCE_GROUP_NAME>"
+          WorkspaceName: "<YOUR_WORKSPACE_NAME>"
+          Template: |-
+            let usersWithSuspiciousEmails = EmailEvents
+            | where Subject has_all ("shared", "with you")
+            | where Subject has_any ("payment", "invoice", "urgent", "mandatory", "Payoff", "Wire", "Confirmation", "password")
+            | where isnotempty(RecipientObjectId)
+            | summarize RecipientCount = dcount(RecipientObjectId), RecipientList = make_set(RecipientObjectId) by Subject
+            | where RecipientCount >= 10
+            | mv-expand RecipientList to typeof(string)
+            | distinct RecipientList;
+            AADSignInEventsBeta
+            | where AccountObjectId in (usersWithSuspiciousEmails)
+            | where RiskLevelDuringSignIn == 100
+
+      - Name: AgentHuntHighConfidencePhishReleased
+        DisplayName: "AgentHunt - High Confidence Phish Released"
+        Description: Detects instances where high confidence phishing emails were released from quarantine by users.
+        Settings:
+          Target: Sentinel
+          TenantId: "<YOUR_TENANT_ID>"
+          SubscriptionId: "<YOUR_SUBSCRIPTION_ID>"
+          ResourceGroupName: "<YOUR_RESOURCE_GROUP_NAME>"
+          WorkspaceName: "<YOUR_WORKSPACE_NAME>"
+          Template: |-
+            CloudAppEvents 
+            | where ActionType == "QuarantineReleaseMessage"
+            | project ReleaseTime = Timestamp, ResultStatus = RawEventData.ResultStatus, ActionType, ReleasedBy = tostring(RawEventData.UserId), NetworkMessageId = tostring(RawEventData.NetworkMessageId), ReleaseTo = RawEventData.ReleaseTo
+            | join kind=inner (
+                EmailEvents
+                | where todynamic(ConfidenceLevel).Phish == "High"
+                | project-rename EmailTime = Timestamp
+              ) on NetworkMessageId
+            | project-away NetworkMessageId1
+            | order by ReleaseTime asc
+
+      - Name: AgentHuntEmailConversationTakeover
+        DisplayName: "AgentHunt - Email Conversation Takeover Attempts"
+        Description: Identifies potential email conversation takeover attempts by detecting replies to prior conversations from previously unseen senders or domains.
+        Settings:
+          Target: Sentinel
+          TenantId: "<YOUR_TENANT_ID>"
+          SubscriptionId: "<YOUR_SUBSCRIPTION_ID>"
+          ResourceGroupName: "<YOUR_RESOURCE_GROUP_NAME>"
+          WorkspaceName: "<YOUR_WORKSPACE_NAME>"
+          Template: |-
+            let emailDelivered = EmailEvents
+            | where Timestamp < ago(4hrs)
+            and DeliveryAction == "Delivered"
+            | extend Pair = strcat(SenderMailFromAddress,"|",RecipientEmailAddress)
+            | distinct Pair;
+            let EmailDomains = EmailEvents
+            | where Timestamp < ago(4hrs)
+            and DeliveryAction == "Delivered"
+            | distinct SenderFromDomain;
+            EmailEvents
+            | where Timestamp >= ago(4hrs)
+            | where DeliveryLocation != "Quarantine"
+            and EmailDirection == "Inbound"
+            and OrgLevelAction != "Block"
+            and UserLevelAction != "Block"
+            | extend NewMsg = case(Subject contains "RE:", false, Subject contains "FW:", false, true )
+            | project Pair = strcat(SenderMailFromAddress,"|",RecipientEmailAddress), NetworkMessageId, SenderFromDomain, SenderMailFromAddress, RecipientEmailAddress, DeliveryAction, ThreatTypes, DetectionMethods, NewMsg, Subject
+            | join kind=leftouter ( emailDelivered ) on Pair
+            | order by SenderMailFromAddress
+            | where NewMsg == false
+            and Pair1 == ""
+            | join kind=leftouter (EmailDomains) on SenderFromDomain
+            | where SenderFromDomain1 == ""
+            | distinct Pair, NetworkMessageId, SenderFromDomain, SenderMailFromAddress, RecipientEmailAddress, DeliveryAction, ThreatTypes, DetectionMethods, NewMsg, Subject
+
+      - Name: AgentHuntMaliciousAttachmentIOC
+        DisplayName: "AgentHunt - Malicious Attachments via External IOC"
+        Description: Identifies emails with attachments that match SHA256 hashes from a recent external threat intelligence feed.
+        Settings:
+          Target: Sentinel
+          TenantId: "<YOUR_TENANT_ID>"
+          SubscriptionId: "<YOUR_SUBSCRIPTION_ID>"
+          ResourceGroupName: "<YOUR_RESOURCE_GROUP_NAME>"
+          WorkspaceName: "<YOUR_WORKSPACE_NAME>"
+          Template: |-
+            let abuse_sha256 = (externaldata(sha256_hash: string)
+            [@"https://bazaar.abuse.ch/export/txt/sha256/recent/"]
+            with (format="txt"))
+            | where sha256_hash !startswith "#"
+            | project sha256_hash;
+            abuse_sha256
+            | join (EmailAttachmentInfo
+            | where Timestamp > ago(1d)
+            ) on $left.sha256_hash == $right.SHA256
+            | project Timestamp,SenderFromAddress,RecipientEmailAddress,FileName,FileType,SHA256,ThreatTypes,DetectionMethods,NetworkMessageId,ReportId
+
+
+      - Name: AgentHuntMaliciousURLIOC
+        DisplayName: "AgentHunt - Malicious URLs via External IOC"
+        Description: Identifies emails containing URLs that match indicators of compromise (IOCs) from a real-time external threat feed.
+        Settings:
+          Target: Sentinel
+          TenantId: "<YOUR_TENANT_ID>"
+          SubscriptionId: "<YOUR_SUBSCRIPTION_ID>"
+          ResourceGroupName: "<YOUR_RESOURCE_GROUP_NAME>"
+          WorkspaceName: "<YOUR_WORKSPACE_NAME>"
+          Template: |-
+            let url = (externaldata(url: string)
+            [@"https://urlhaus.abuse.ch/downloads/text_online/"]
+            with (format="txt"))
+            | project url;
+            url
+            | join (EmailUrlInfo
+            | where Timestamp > ago(2h)
+            ) on $left.url == $right.Url
+            | join EmailEvents on NetworkMessageId
+            | project Timestamp, NetworkMessageId, Url, UrlLocation, UrlDomain, SenderFromAddress, SenderDisplayName, SenderIPv4, Subject, RecipientEmailAddress, RecipientObjectId, LatestDeliveryAction, ThreatNames, ThreatTypes, DetectionMethods, DeliveryAction, ReportId
+
+      - Name: AgentHuntSuspiciousSenderPatterns
+        DisplayName: "AgentHunt - Suspicious Sender Pattern Detection"
+        Description: Correlates inbound emails with impersonation-style display names and uncommon sender domains, especially with suspicious image attachments.
+        Settings:
+          Target: Sentinel
+          TenantId: "<YOUR_TENANT_ID>"
+          SubscriptionId: "<YOUR_SUBSCRIPTION_ID>"
+          ResourceGroupName: "<YOUR_RESOURCE_GROUP_NAME>"
+          WorkspaceName: "<YOUR_WORKSPACE_NAME>"
+          Template: |-
+            let PhishingSenderDisplayNames = ()
+            {
+            pack_array("IT", "support", "Payroll", "HR", "admin", "2FA", "notification", "sign", "reminder", "consent", "workplace",
+            "administrator", "administration", "benefits", "employee", "update", "on behalf");
+            };
+            let suspiciousEmails = EmailEvents
+            | where Timestamp > ago(1d)
+            | where isnotempty(RecipientObjectId)
+            | where isnotempty(SenderFromAddress)
+            | where EmailDirection == "Inbound"
+            | where DeliveryAction == "Delivered"
+            | join kind=inner (EmailAttachmentInfo
+            | where Timestamp > ago(1d)
+            | where isempty(SenderObjectId)
+            | where FileType has_any ("png", "jpg", "jpeg", "bmp", "gif")
+            ) on NetworkMessageId
+            | where SenderDisplayName has_any (PhishingSenderDisplayNames())
+            | project Timestamp, Subject, FileName, SenderFromDomain, RecipientObjectId, NetworkMessageId;
+            let suspiciousSenders = suspiciousEmails | distinct SenderFromDomain;
+            let prevalentSenders = materialize(EmailEvents
+            | where Timestamp between (ago(7d) .. ago(1d))
+            | where isnotempty(RecipientObjectId)
+            | where isnotempty(SenderFromAddress)
+            | where SenderFromDomain in (suspiciousSenders)
+            | where EmailDirection == "Inbound"
+            | where DeliveryAction == "Delivered"
+            | distinct SenderFromDomain);
+            suspiciousEmails
+            | where SenderFromDomain !in (prevalentSenders)
+            | project Timestamp, Subject, FileName, SenderFromDomain, RecipientObjectId, NetworkMessageId
+
+      - Name: AgentHuntUserReportedClusters
+        DisplayName: "AgentHunt - User-Reported Campaign Clusters"
+        Description: Identifies campaign clusters using EmailClusterId based on user-reported phishing or malware messages.
+        Settings:
+          Target: Sentinel
+          TenantId: "<YOUR_TENANT_ID>"
+          SubscriptionId: "<YOUR_SUBSCRIPTION_ID>"
+          ResourceGroupName: "<YOUR_RESOURCE_GROUP_NAME>"
+          WorkspaceName: "<YOUR_WORKSPACE_NAME>"
+          Template: |-
+            let suspiciousClusters = EmailEvents
+            | where Timestamp > ago(7d)
+            | where EmailDirection == "Inbound"
+            | where NetworkMessageId in (
+              "5ff15b1f-d731-4625-4c1c-08dc8615943f",
+              "00ff0916-1263-428c-a558-08dc86a6d3cd") // Replace with actual NMIDs from alerts
+            | distinct EmailClusterId;
+            EmailEvents
+            | where Timestamp > ago(7d)
+            | where EmailDirection == "Inbound"
+            | where EmailClusterId in (suspiciousClusters)
+            | summarize make_set(Subject), make_set(SenderFromDomain), dcount(RecipientObjectId), dcount(SenderDisplayName) by EmailClusterId
+
+      - Name: AgentHuntInboundQRCodeSummary
+        DisplayName: "AgentHunt - Inbound Emails with QR Code URLs (30d)"
+        Description: Summarizes the volume of inbound emails containing QR code URLs over the last 30 days.
+        Settings:
+          Target: Sentinel
+          TenantId: "<YOUR_TENANT_ID>"
+          SubscriptionId: "<YOUR_SUBSCRIPTION_ID>"
+          ResourceGroupName: "<YOUR_RESOURCE_GROUP_NAME>"
+          WorkspaceName: "<YOUR_WORKSPACE_NAME>"
+          Template: |-
+            EmailEvents
+            | where Timestamp > ago(30d)
+            | where EmailDirection == "Inbound"
+            | join EmailUrlInfo on NetworkMessageId
+            | where UrlLocation == "QRCode"
+            | summarize dcount(NetworkMessageId) by bin(Timestamp, 1d)
+            | render timechart
+
+      - Name: AgentHuntJNLPAttachment
+        DisplayName: "AgentHunt - JNLP File Attachment Detection"
+        Description: Identifies emails with attached `.jnlp` files, which are uncommon and often used to deliver malware.
+        Settings:
+          Target: Sentinel
+          TenantId: "<YOUR_TENANT_ID>"
+          SubscriptionId: "<YOUR_SUBSCRIPTION_ID>"
+          ResourceGroupName: "<YOUR_RESOURCE_GROUP_NAME>"
+          WorkspaceName: "<YOUR_WORKSPACE_NAME>"
+          Template: |-
+            EmailAttachmentInfo
+            | where FileName endswith ".jnlp"
+
+      - Name: AgentHuntEmailRemediationActions
+        DisplayName: "AgentHunt - Email Remediation Actions via Explorer"
+        Description: Lists Defender for Office 365 email remediation actions taken via Explorer, such as hard delete, soft delete, and junk folder moves.
+        Settings:
+          Target: Sentinel
+          TenantId: "<YOUR_TENANT_ID>"
+          SubscriptionId: "<YOUR_SUBSCRIPTION_ID>"
+          ResourceGroupName: "<YOUR_RESOURCE_GROUP_NAME>"
+          WorkspaceName: "<YOUR_WORKSPACE_NAME>"
+          Template: |-
+            EmailEvents
+            | where Timestamp > ago(30d)
+            | where LatestDeliveryAction in ("Hard delete", "Soft delete", "Moved to junk folder", "Moved to deleted items")
+            | summarize HardDelete_NetworkID = make_list_if(strcat(NetworkMessageId, @"\", Timestamp,@"\", Subject), LatestDeliveryAction == "Hard delete"),  
+                        SoftDelete_NetworkID = make_list_if(strcat(NetworkMessageId, @"\", Timestamp,@"\", Subject), LatestDeliveryAction == "Soft delete"),
+                        MoveToJunk_NetworkID = make_list_if(strcat(NetworkMessageId, @"\", Timestamp,@"\", Subject), LatestDeliveryAction == "Moved to junk folder"),
+                        MoveToDelete_NetworkID = make_list_if(strcat(NetworkMessageId, @"\", Timestamp,@"\", Subject), LatestDeliveryAction == "Moved to deleted items") by RecipientEmailAddress
+            | extend HardDelete_case = array_length(HardDelete_NetworkID)
+            | extend SoftDelete_case = array_length(SoftDelete_NetworkID)
+            | extend MoveToJunk_case = array_length(MoveToJunk_NetworkID)
+            | extend MoveToDelete_case = array_length(MoveToDelete_NetworkID)
+            | extend Sum_case = HardDelete_case + SoftDelete_case + MoveToJunk_case + MoveToDelete_case
+            | project RecipientEmailAddress, Sum_case, HardDelete_case, SoftDelete_case, MoveToJunk_case, MoveToDelete_case, HardDelete_NetworkID, SoftDelete_NetworkID, MoveToJunk_NetworkID, MoveToDelete_NetworkID
+            | order by Sum_case desc
+
+      - Name: AgentHuntLocalToUTCConversion
+        DisplayName: "AgentHunt - Local to UTC Time Conversion"
+        Description: Converts local time range to UTC for accurate filtering in Advanced Hunting queries and retrieves quarantined emails delivered during that period.
+        Settings:
+          Target: Sentinel
+          TenantId: "<YOUR_TENANT_ID>"
+          SubscriptionId: "<YOUR_SUBSCRIPTION_ID>"
+          ResourceGroupName: "<YOUR_RESOURCE_GROUP_NAME>"
+          WorkspaceName: "<YOUR_WORKSPACE_NAME>"
+          Template: |-
+            EmailEvents
+            | where Timestamp between (datetime_local_to_utc(datetime(2023-08-10T00:00:00Z),"Europe/Madrid") .. datetime_local_to_utc(datetime(2023-08-31T23:59:59Z),"Europe/Madrid"))
+            | where DeliveryAction == "Delivered"
+            | where LatestDeliveryLocation == "Quarantine"
+
+      - Name: AgentHuntMailReplyToNewDomain
+        DisplayName: "AgentHunt - Mail Reply to New Domain"
+        Description: Identifies email replies to new domains where there is no prior communication history, potentially indicating a conversation hijack attempt.
+        Settings:
+          Target: Sentinel
+          TenantId: "<YOUR_TENANT_ID>"
+          SubscriptionId: "<YOUR_SUBSCRIPTION_ID>"
+          ResourceGroupName: "<YOUR_RESOURCE_GROUP_NAME>"
+          WorkspaceName: "<YOUR_WORKSPACE_NAME>"
+          Template: |-
+            let emailDelivered = EmailEvents
+            | where Timestamp < ago(4hrs)
+            and DeliveryAction == "Delivered"
+            | extend Pair = strcat(SenderMailFromAddress,"|",RecipientEmailAddress)
+            | distinct Pair;
+            let EmailDomains = EmailEvents
+            | where Timestamp < ago(4hrs)
+            and DeliveryAction == "Delivered"
+            | distinct SenderFromDomain;
+            EmailEvents 
+            | where Timestamp >= ago(4hrs)
+            | where DeliveryLocation != "Quarantine"
+            and EmailDirection == "Inbound" 
+            and OrgLevelAction != "Block"
+            and UserLevelAction != "Block"
+            | extend NewMsg = case(Subject contains "RE:", false, Subject contains "FW:", false, true )
+            | project Pair = strcat(SenderMailFromAddress,"|",RecipientEmailAddress), NetworkMessageId, SenderFromDomain, SenderMailFromAddress, RecipientEmailAddress, DeliveryAction, ThreatTypes, DetectionMethods, NewMsg, Subject 
+            | join kind=leftouter ( emailDelivered ) on Pair
+            | order by SenderMailFromAddress
+            | where NewMsg == false
+            and Pair1 == ""
+            | join kind=leftouter (EmailDomains) on SenderFromDomain
+            | where SenderFromDomain1 == ""
+            | distinct Pair, NetworkMessageId, SenderFromDomain, SenderMailFromAddress, RecipientEmailAddress, DeliveryAction, ThreatTypes, DetectionMethods, NewMsg, Subject
+
+      - Name: AgentHuntMailflowByDirection
+        DisplayName: "AgentHunt - Mailflow by Directionality"
+        Description: Summarizes daily email flow by direction (Inbound, Outbound, Intra-org) and recipient domain over the past 30 days.
+        Settings:
+          Target: Sentinel
+          TenantId: "<YOUR_TENANT_ID>"
+          SubscriptionId: "<YOUR_SUBSCRIPTION_ID>"
+          ResourceGroupName: "<YOUR_RESOURCE_GROUP_NAME>"
+          WorkspaceName: "<YOUR_WORKSPACE_NAME>"
+          Template: |-
+            EmailEvents 
+            | where Timestamp > ago(30d)
+            | extend domain = substring(RecipientEmailAddress, indexof(RecipientEmailAddress, "@")+1) 
+            | summarize total=count() by EmailDirection, domain, bin(Timestamp, 1d) 
+            | order by Timestamp asc
+
+      - Name: AgentHuntMaliciousEmailSenders
+        DisplayName: "AgentHunt - Malicious Email Senders"
+        Description: Identifies emails delivered to inbox from senders that previously had emails quarantined.
+        Settings:
+          Target: Sentinel
+          TenantId: "<YOUR_TENANT_ID>"
+          SubscriptionId: "<YOUR_SUBSCRIPTION_ID>"
+          ResourceGroupName: "<YOUR_RESOURCE_GROUP_NAME>"
+          WorkspaceName: "<YOUR_WORKSPACE_NAME>"
+          Template: |-
+            let SenderWithQuarantine = EmailEvents
+            | where LatestDeliveryLocation == "Quarantine"
+            | project SenderFromAddress;
+            EmailEvents
+            | where LatestDeliveryLocation == "Inbox/folder"
+            | where SenderFromAddress in (SenderWithQuarantine)
+
+      - Name: AgentHuntMaliciousEmailsPerDay
+        DisplayName: "AgentHunt - Malicious Emails Detected Per Day"
+        Description: Summarizes daily detections of malware, phishing, and spam emails using Defender XDR data.
+        Settings:
+          Target: Sentinel
+          TenantId: "<YOUR_TENANT_ID>"
+          SubscriptionId: "<YOUR_SUBSCRIPTION_ID>"
+          ResourceGroupName: "<YOUR_RESOURCE_GROUP_NAME>"
+          WorkspaceName: "<YOUR_WORKSPACE_NAME>"
+          Template: |-
+            EmailEvents
+            | where DetectionMethods != "" 
+            | extend detection = parse_json(DetectionMethods) 
+            | extend Spam = tostring(detection.Spam), Phish = tostring(detection.Phish), Malware = tostring(detection.Malware) 
+            | where Spam != '' or Phish != '' or Malware != '' 
+            | extend detection = case(
+                Malware != "", 'Malware',
+                Phish != "", 'Phish',
+                'Spam'
+              )
+            | summarize total = count() by detection, bin(Timestamp, 1d)
+            | order by Timestamp asc
+
+      - Name: AgentHuntMaliciousMailsBySenderIP
+        DisplayName: "AgentHunt - Malicious Mails by Sender IPs"
+        Description: Lists sender IPs that have sent phishing or malware emails in the past 30 days, using Microsoft Defender XDR data.
+        Settings:
+          Target: Sentinel
+          TenantId: "<YOUR_TENANT_ID>"
+          SubscriptionId: "<YOUR_SUBSCRIPTION_ID>"
+          ResourceGroupName: "<YOUR_RESOURCE_GROUP_NAME>"
+          WorkspaceName: "<YOUR_WORKSPACE_NAME>"
+          Template: |-
+            EmailEvents 
+            | where Timestamp > ago(30d) 
+            | where ThreatTypes has "Phish" or ThreatTypes has "Malware"
+            | summarize count() by SenderIPv4
+            | sort by count_ desc
+
+      - Name: AgentHuntMalwareByDetectionMethod
+        DisplayName: "AgentHunt - Malware Detections by Method"
+        Description: Returns malware detections over the past 30 days, filtered by known detection methods (e.g., file and URL detonations), using Microsoft Defender XDR data.
+        Settings:
+          Target: Sentinel
+          TenantId: "<YOUR_TENANT_ID>"
+          SubscriptionId: "<YOUR_SUBSCRIPTION_ID>"
+          ResourceGroupName: "<YOUR_RESOURCE_GROUP_NAME>"
+          WorkspaceName: "<YOUR_WORKSPACE_NAME>"
+          Template: |-
+            EmailEvents
+            | where Timestamp > ago(30d)
+            | where isnotempty(DetectionMethods)
+            | extend MDO_detection = parse_json(DetectionMethods)
+            | where MDO_detection.Malware in 
+                    (
+                      @'["File detonation reputation"]',
+                      @'["File detonation"]',
+                      @'["File reputation"]',
+                      @'["Antimalware engine"]',
+                      @'["URL malicious reputation"]',
+                      @'["URL detonation reputation"]',
+                      @'["URL detonation"]'
+                    )
+            | extend SenderFromAddress_IPv4 = strcat(SenderFromAddress, ", ", SenderIPv4)
+            | project Timestamp, NetworkMessageId, Subject, SenderFromAddress_IPv4, RecipientEmailAddress, DeliveryLocation, MDO_detection.Malware
+
+      - Name: AgentHuntMDODailySummary
+        DisplayName: "AgentHunt - MDO Daily Detection Summary"
+        Description: Generates a daily detection summary of inbound email threats and user-reported messages, including AIR investigation outcomes and ZAP actions over the last 30 days.
+        Settings:
+          Target: Sentinel
+          TenantId: "<YOUR_TENANT_ID>"
+          SubscriptionId: "<YOUR_SUBSCRIPTION_ID>"
+          ResourceGroupName: "<YOUR_RESOURCE_GROUP_NAME>"
+          WorkspaceName: "<YOUR_WORKSPACE_NAME>"
+          Template: |-
+            let QueryTime = 30d;
+            let Reports = CloudAppEvents 
+            | where Timestamp > ago(QueryTime)
+            | where ActionType == "UserSubmission" or ActionType == "AdminSubmission"
+            | extend MessageDate = todatetime((parse_json(RawEventData)).MessageDate)
+            | extend NetworkMessageID = tostring((parse_json(RawEventData)).ObjectId)
+            | extend Date_value = tostring(format_datetime(MessageDate, "yyyy-MM-dd"))
+            | distinct Date_value, NetworkMessageID
+            | summarize count() by Date_value
+            | project Date_value, MessagesGotReported = count_;
+            
+            let ThreatByAutomation = AlertEvidence 
+            | where Title == "Email reported by user as malware or phish"
+            | extend LastVerdictfromAutomation = tostring(parse_json(AdditionalFields).LastVerdict)
+            | extend Date_value = tostring(format_datetime(Timestamp, "yyyy-MM-dd"))
+            | extend DetectionFromAIR = iif(isempty(LastVerdictfromAutomation), "NoThreatsFound", LastVerdictfromAutomation)
+            | summarize 
+                PostDeliveryTotalAIRInvestigations = count(),
+                PostDeliveryAirNoThreatsFound = countif(DetectionFromAIR contains "NoThreatsFound"),
+                PostDeliveryAirSuspicious = countif(DetectionFromAIR contains "Suspicious"),
+                PostDeliveryAirMalicious = countif(DetectionFromAIR contains "Malicious")
+            by Date_value;
+            
+            let DeliveryInboundEvents = EmailEvents
+            | where EmailDirection == "Inbound" and Timestamp > ago(QueryTime)
+            | extend Date_value = tostring(format_datetime(Timestamp, "yyyy-MM-dd"))
+            | project Date_value, Timestamp, NetworkMessageId, DetectionMethods, RecipientEmailAddress;
+            
+            let PostDeliveryEvents = EmailPostDeliveryEvents 
+            | where ActionType contains "ZAP" and ActionResult == "Success"
+            | join kind=inner (DeliveryInboundEvents) on RecipientEmailAddress, NetworkMessageId
+            | extend Date_value = tostring(format_datetime(Timestamp, "yyyy-MM-dd"))
+            | summarize PostDeliveryZAP = count() by Date_value;
+            
+            let DeliveryByThreat = DeliveryInboundEvents
+            | extend MDO_detection = parse_json(DetectionMethods)
+            | extend FirstDetection = iif(isempty(MDO_detection), "Clean", tostring(bag_keys(MDO_detection)[0]))
+            | extend FirstSubcategory = iif(FirstDetection != "Clean" and array_length(MDO_detection[FirstDetection]) > 0, strcat(FirstDetection, ": ", tostring(MDO_detection[FirstDetection][0])), "No Detection (clean)")
+            | summarize 
+                TotalEmails = count(),
+                Clean = countif(FirstSubcategory contains "Clean"),
+                Malware = countif(FirstSubcategory contains "Malware"),
+                Phish = countif(FirstSubcategory contains "Phish"),
+                Spam = countif(FirstSubcategory contains "Spam" and FirstSubcategory !contains "Bulk"),
+                Bulk = countif(FirstSubcategory contains "Bulk")
+            by Date_value;
+            
+            DeliveryByThreat
+            | join kind=fullouter Reports on Date_value
+            | join kind=fullouter PostDeliveryEvents on Date_value
+            | join kind=fullouter ThreatByAutomation on Date_value
+            | sort by Date_value asc
+            | project Date_value, Clean, Malware, Phish, Spam, Bulk, MessagesGotReported, PostDeliveryZAP, PostDeliveryTotalAIRInvestigations, PostDeliveryAirNoThreatsFound, PostDeliveryAirMalicious, PostDeliveryAirSuspicious
+            | where isnotempty(Date_value)
+
+      - Name: AgentHuntMDOCountRecipientsBySubject
+        DisplayName: "AgentHunt - MDO Count of Recipients by Subject"
+        Description: Identifies subjects that were received by a high number of recipient email addresses to detect potential phishing campaigns.
+        Settings:
+          Target: Sentinel
+          TenantId: "<YOUR_TENANT_ID>"
+          SubscriptionId: "<YOUR_SUBSCRIPTION_ID>"
+          ResourceGroupName: "<YOUR_RESOURCE_GROUP_NAME>"
+          WorkspaceName: "<YOUR_WORKSPACE_NAME>"
+          Template: |-
+            EmailEvents
+            | where Timestamp > ago(10d)
+            | summarize CountRecipientEmailAddress = count() by RecipientEmailAddress, Subject
+            | where CountRecipientEmailAddress >= 15
+            | project RecipientEmailAddress, CountRecipientEmailAddress, Subject
+
+      - Name: AgentHuntMDOCountOfRecipientsBySubject
+        DisplayName: "AgentHunt - Count of Recipients by Subject"
+        Description: Identifies subjects that were received by many recipient email addresses, useful for spotting coordinated phishing campaigns.
+        Settings:
+          Target: Sentinel
+          TenantId: "<YOUR_TENANT_ID>"
+          SubscriptionId: "<YOUR_SUBSCRIPTION_ID>"
+          ResourceGroupName: "<YOUR_RESOURCE_GROUP_NAME>"
+          WorkspaceName: "<YOUR_WORKSPACE_NAME>"
+          Template: |-
+            EmailEvents
+            | where Timestamp > ago(10d)
+            | summarize CountRecipientEmailAddress = count() by RecipientEmailAddress, Subject
+            | where CountRecipientEmailAddress >= 15
+            | project RecipientEmailAddress, CountRecipientEmailAddress, Subject
+
+      - Name: AgentHuntMDOCountOfSendersBySubject
+        DisplayName: "AgentHunt - Count of Senders by Subject"
+        Description: Identifies subjects that were repeatedly sent by the same sender, useful for tracking spam or phishing campaigns.
+        Settings:
+          Target: Sentinel
+          TenantId: "<YOUR_TENANT_ID>"
+          SubscriptionId: "<YOUR_SUBSCRIPTION_ID>"
+          ResourceGroupName: "<YOUR_RESOURCE_GROUP_NAME>"
+          WorkspaceName: "<YOUR_WORKSPACE_NAME>"
+          Template: |-
+            EmailEvents
+            | where Timestamp > ago(10d)
+            | summarize CountSenderFromAddress = count() by SenderFromAddress, Subject
+            | where CountSenderFromAddress >= 10
+            | project SenderFromAddress, CountSenderFromAddress, Subject
+
+      - Name: AgentHuntMDOSummaryOfSenders
+        DisplayName: "AgentHunt - Summary of Senders by Delivery Location"
+        Description: Summarizes the number of emails sent by each sender and their delivery location (Inbox, Junk, Quarantine).
+        Settings:
+          Target: Sentinel
+          TenantId: "<YOUR_TENANT_ID>"
+          SubscriptionId: "<YOUR_SUBSCRIPTION_ID>"
+          ResourceGroupName: "<YOUR_RESOURCE_GROUP_NAME>"
+          WorkspaceName: "<YOUR_WORKSPACE_NAME>"
+          Template: |-
+            EmailEvents
+            | summarize 
+                QuaratineEmails = countif(DeliveryLocation == "Quarantine"),
+                Emails = countif(DeliveryLocation == "Inbox/folder"),
+                JunkEmails = countif(DeliveryLocation == "Junk folder")
+              by SenderFromAddress
+
+      - Name: AgentHuntMDOURLClickedInEmail
+        DisplayName: "AgentHunt - URLs Clicked in Email"
+        Description: Lists URLs that users have clicked in emails where the action type was 'ClickAllowed'.
+        Settings:
+          Target: Sentinel
+          TenantId: "<YOUR_TENANT_ID>"
+          SubscriptionId: "<YOUR_SUBSCRIPTION_ID>"
+          ResourceGroupName: "<YOUR_RESOURCE_GROUP_NAME>"
+          WorkspaceName: "<YOUR_WORKSPACE_NAME>"
+          Template: |-
+            UrlClickEvents
+            | where ActionType == "ClickAllowed"
+            | project AccountUpn, ActionType, Url
+
+      - Name: AgentHuntMDOPersonalizedCampaigns
+        DisplayName: "AgentHunt - Personalized Campaigns by Subject Prefix"
+        Description: Identifies potential personalized phishing campaigns by analyzing the first few words of the subject line across multiple recipients.
+        Settings:
+          Target: Sentinel
+          TenantId: "<YOUR_TENANT_ID>"
+          SubscriptionId: "<YOUR_SUBSCRIPTION_ID>"
+          ResourceGroupName: "<YOUR_RESOURCE_GROUP_NAME>"
+          WorkspaceName: "<YOUR_WORKSPACE_NAME>"
+          Template: |-
+            EmailEvents
+            | where Timestamp > ago(1d)
+            | where EmailDirection == "Inbound"
+            | where DeliveryAction == "Delivered"
+            | where isempty(SenderObjectId)
+            | extend words = split(Subject, " ")
+            | project firstWord = tostring(words[0]), secondWord = tostring(words[1]), thirdWord = tostring(words[2]), Subject, SenderFromAddress, RecipientEmailAddress, NetworkMessageId
+            | summarize SubjectsCount = dcount(Subject), RecipientsCount = dcount(RecipientEmailAddress), suspiciousEmails = make_set(NetworkMessageId, 10) by firstWord, secondWord, thirdWord, SenderFromAddress
+            | where SubjectsCount >= 10
+
+      - Name: AgentHuntMDOPhishDetectionMethods
+        DisplayName: "AgentHunt - Phish Detections by Detection Methods"
+        Description: Reviews phishing detections using common Microsoft Defender for Office 365 detection technologies over the last 7 days.
+        Settings:
+          Target: Sentinel
+          TenantId: "<YOUR_TENANT_ID>"
+          SubscriptionId: "<YOUR_SUBSCRIPTION_ID>"
+          ResourceGroupName: "<YOUR_RESOURCE_GROUP_NAME>"
+          WorkspaceName: "<YOUR_WORKSPACE_NAME>"
+          Template: |-
+            EmailEvents
+            | where Timestamp > ago(7d)
+            | where isnotempty(DetectionMethods)
+            | extend MDO_detection = parse_json(DetectionMethods)
+            | where MDO_detection.Phish in 
+                    (
+                      @'["URL malicious reputation"]',
+                      @'["URL detonation reputation"]',
+                      @'["URL detonation"]',
+                      @'["Advanced filter"]',
+                      @'["General filter"]',
+                      @'["Spoof intra-org"]',
+                      @'["Spoof external domain"]',
+                      @'["Spoof DMARC"]',
+                      @'["Impersonation brand"]',
+                      @'["Mixed analysis detection"]',
+                      @'["File reputation"]',
+                      @'["File detonation reputation"]',
+                      @'["File detonation"]',
+                      @'["Fingerprint matching"]'
+                    )
+            | extend SenderFromAddress_IPv4 = strcat(SenderFromAddress, ", ", SenderIPv4)
+            | project Timestamp, NetworkMessageId, Subject, SenderFromAddress_IPv4, RecipientEmailAddress, DeliveryLocation, MDO_detection.Phish
+
+      - Name: AgentHuntPhishRedirectorURLs
+        DisplayName: "AgentHunt - Phishing Emails Using T-Dot Redirector URLs"
+        Description: Detects phishing emails that use known open redirector patterns and malicious domains using Microsoft Defender for Office 365 data.
+        Settings:
+          Target: Sentinel
+          TenantId: "<YOUR_TENANT_ID>"
+          SubscriptionId: "<YOUR_SUBSCRIPTION_ID>"
+          ResourceGroupName: "<YOUR_RESOURCE_GROUP_NAME>"
+          WorkspaceName: "<YOUR_WORKSPACE_NAME>"
+          Template: |-
+            EmailUrlInfo
+            // This regex identifies emails containing the "T-Dot" redirector pattern in the URL
+            | where Url matches regex @"s?\:\/\/(?:www\.)?t\.(?:[\w\-\.]+\/+)+(?:r|redirect)\/?\?" 
+              // This regex narrows in on emails that contain the known malicious domain pattern in the URL from the most recent campaigns
+              and Url matches regex @"[a-zA-Z]\-[a-zA-Z]{2}\.(xyz|club|shop)"
+
+      - Name: AgentHuntReferralPhish
+        DisplayName: "AgentHunt - Credential Phish Using Referral Infrastructure"
+        Description: Hunts for credential phishing emails that use known suspicious referral infrastructure domains, based on Microsoft Defender for Office 365 data.
+        Settings:
+          Target: Sentinel
+          TenantId: "<YOUR_TENANT_ID>"
+          SubscriptionId: "<YOUR_SUBSCRIPTION_ID>"
+          ResourceGroupName: "<YOUR_RESOURCE_GROUP_NAME>"
+          WorkspaceName: "<YOUR_WORKSPACE_NAME>"
+          Template: |-
+            let EmailAddresses = pack_array(
+              'zreffertalt.com.com','zreffesral.com.com','kzreffertal.com.com',
+              'wzreffertal.com.com','refferal.comq','refferal.net','zreffertal.com.com',
+              'zrefferal.com.com','refferasl.com.com','zreffesral.com','zrefsfertal.com.com',
+              'irefferal.com','refferasl.co','zrefferal.com');
+            EmailEvents
+            | where SenderMailFromDomain in (EmailAddresses)
+            | extend RecipientDomain = extract("[^@]+$", 0, RecipientEmailAddress)
+            | where SenderFromDomain == RecipientDomain
+            | join EmailUrlInfo on $left.NetworkMessageId == $right.NetworkMessageId
+
+      - Name: AgentHuntSafeLinksDetections
+        DisplayName: "AgentHunt - SafeLinks URL Detections"
+        Description: Provides insights into phishing detections triggered by SafeLinks protection in Microsoft Defender for Office 365, focusing on URL-based threats.
+        Settings:
+          Target: Sentinel
+          TenantId: "<YOUR_TENANT_ID>"
+          SubscriptionId: "<YOUR_SUBSCRIPTION_ID>"
+          ResourceGroupName: "<YOUR_RESOURCE_GROUP_NAME>"
+          WorkspaceName: "<YOUR_WORKSPACE_NAME>"
+          Template: |-
+            EmailEvents 
+            | where DetectionMethods != "" 
+            | extend detection = tostring(parse_json(DetectionMethods).Phish) 
+            | where detection == '["URL detonation reputation"]' or detection == '["URL detonation"]' 
+            | summarize total = count() by bin(Timestamp, 1d) 
+            | order by Timestamp asc
+
+      - Name: AgentHuntSenderRecipientContact
+        DisplayName: "AgentHunt - Sender Recipient Contact Establishment"
+        Description: Identifies inbound messages from frequent external senders that have not previously contacted specific internal recipients within the past 30 days. Useful for spotting new or suspicious sender-recipient relationships.
+        Settings:
+          Target: Sentinel
+          TenantId: "<YOUR_TENANT_ID>"
+          SubscriptionId: "<YOUR_SUBSCRIPTION_ID>"
+          ResourceGroupName: "<YOUR_RESOURCE_GROUP_NAME>"
+          WorkspaceName: "<YOUR_WORKSPACE_NAME>"
+          Template: |-
+            let emailDelivered = EmailEvents
+            | where Timestamp < ago(30d)
+            and DeliveryAction == "Delivered"
+            and SenderDisplayName contains "Microsoft"
+            | summarize count() by SenderFromAddress
+            | where count_ > 3
+            | project SenderFromAddress;
+            EmailEvents 
+            | where Timestamp > ago(24hrs)
+            | where DeliveryAction == "Delivered"
+              and EmailDirection == "Inbound" 
+              and OrgLevelAction != "Block"
+              and UserLevelAction != "Block"
+              and SenderDisplayName contains "Microsoft"
+            | extend NewMsg = case(Subject contains "RE:", false, Subject contains "FW:", false, true )
+            | project SenderDisplayName, SenderFromAddress, NetworkMessageId, SenderMailFromAddress, RecipientEmailAddress, DeliveryAction, DeliveryLocation, ThreatTypes, DetectionMethods, NewMsg, Subject 
+            | join kind=leftanti  ( emailDelivered ) on SenderFromAddress
+            | order by SenderMailFromAddress
+            | summarize count() by SenderDisplayName, SenderFromAddress, NetworkMessageId, SenderMailFromAddress, RecipientEmailAddress, DeliveryAction, DeliveryLocation, ThreatTypes, DetectionMethods, NewMsg, Subject
+
+      - Name: AgentHuntSpoofImpersonationByIP
+        DisplayName: "AgentHunt - Spoof and Impersonation by Sender IP"
+        Description: Reviews the count of spoofing and impersonation detections attributed to specific sender IPv4 addresses over the past 30 days using Microsoft Defender for Office 365 telemetry.
+        Settings:
+          Target: Sentinel
+          TenantId: "<YOUR_TENANT_ID>"
+          SubscriptionId: "<YOUR_SUBSCRIPTION_ID>"
+          ResourceGroupName: "<YOUR_RESOURCE_GROUP_NAME>"
+          WorkspaceName: "<YOUR_WORKSPACE_NAME>"
+          Template: |-
+            EmailEvents 
+            | where Timestamp > ago(30d) 
+            and (DetectionMethods contains 'spoof' or DetectionMethods contains "impersonation")  
+            | project Timestamp, EmailDirection, SenderFromAddress, AdditionalFields, SenderIPv4 
+            | summarize count() by SenderIPv4
+
+      - Name: AgentHuntSpoofImpersonationPhish
+        DisplayName: "AgentHunt - Spoof & Impersonation Phish Detections"
+        Description: Counts phishing detections where spoofing or impersonation methods were involved, using Microsoft Defender for Office 365 data over the past 30 days.
+        Settings:
+          Target: Sentinel
+          TenantId: "<YOUR_TENANT_ID>"
+          SubscriptionId: "<YOUR_SUBSCRIPTION_ID>"
+          ResourceGroupName: "<YOUR_RESOURCE_GROUP_NAME>"
+          WorkspaceName: "<YOUR_WORKSPACE_NAME>"
+          Template: |-
+            EmailEvents
+            | where Timestamp > ago(30d) and (DetectionMethods contains 'spoof' or DetectionMethods contains "impersonation")
+            | project Timestamp, AR = parse_json(ThreatTypes), DT = parse_json(DetectionMethods), EmailDirection, SenderFromAddress
+            | evaluate bag_unpack(DT)
+            | summarize count() by tostring(Phish)
+
+      - Name: AgentHuntSpoofAuthFailure
+        DisplayName: "AgentHunt - Spoof Attempts with Auth Failures"
+        Description: Identifies spoofing attempts on the domain where at least one authentication mechanism (SPF, DKIM, DMARC, or Composite Authentication) failed, using Microsoft Defender for Office 365 logs.
+        Settings:
+          Target: Sentinel
+          TenantId: "<YOUR_TENANT_ID>"
+          SubscriptionId: "<YOUR_SUBSCRIPTION_ID>"
+          ResourceGroupName: "<YOUR_RESOURCE_GROUP_NAME>"
+          WorkspaceName: "<YOUR_WORKSPACE_NAME>"
+          Template: |-
+            EmailEvents 
+            | where Timestamp > ago(1d) and DetectionMethods contains "spoof"  
+            | project Timestamp, AR = parse_json(AuthenticationDetails), NetworkMessageId, EmailDirection, Subject, SenderFromAddress, SenderIPv4, ThreatTypes, DetectionMethods, ThreatNames  
+            | evaluate bag_unpack(AR)  
+            | where SPF == "fail" or DMARC == "fail" or DKIM == "fail" or CompAuth == "fail"
+
+      - Name: AgentHuntSpoofFromDomains
+        DisplayName: "AgentHunt - Spoof Attempts from Specific Domains"
+        Description: Detects spoofing or phishing attempts from specified domains with authentication failures in Microsoft Defender for Office 365 email logs.
+        Settings:
+          Target: Sentinel
+          TenantId: "<YOUR_TENANT_ID>"
+          SubscriptionId: "<YOUR_SUBSCRIPTION_ID>"
+          ResourceGroupName: "<YOUR_RESOURCE_GROUP_NAME>"
+          WorkspaceName: "<YOUR_WORKSPACE_NAME>"
+          Template: |-
+            let DomainList = dynamic(["contoso.com"]); 
+            EmailEvents 
+            | where TimeGenerated > ago(1d) and DetectionMethods has "spoof" and SenderFromDomain in~ (DomainList)
+            | project TimeGenerated, AR = parse_json(AuthenticationDetails), NetworkMessageId, EmailDirection, Subject, SenderFromAddress, SenderIPv4, ThreatTypes, DetectionMethods, ThreatNames  
+            | evaluate bag_unpack(AR)  
+            | where column_ifexists('SPF','') =~ "fail" or column_ifexists('DMARC','') =~ "fail" or column_ifexists('DKIM','') =~ "fail" or column_ifexists('CompAuth','') =~ "fail"
+            | extend Name = tostring(split(SenderFromAddress, '@', 0)[0]), UPNSuffix = tostring(split(SenderFromAddress, '@', 1)[0])
+            | extend Account_0_Name = Name
+            | extend Account_0_UPNSuffix = UPNSuffix
+            | extend IP_0_Address = SenderIPv4
+
+      - Name: AgentHuntQRPhishSignIn
+        DisplayName: "AgentHunt - Suspicious Sign-in via QR Code Phishing"
+        Description: Correlates sign-in attempts from unmanaged, non-compliant devices flagged as risky with recent email access actions, typically tied to QR code phishing campaigns.
+        Settings:
+          Target: Sentinel
+          TenantId: "<YOUR_TENANT_ID>"
+          SubscriptionId: "<YOUR_SUBSCRIPTION_ID>"
+          ResourceGroupName: "<YOUR_RESOURCE_GROUP_NAME>"
+          WorkspaceName: "<YOUR_WORKSPACE_NAME>"
+          Template: |-
+            let successfulRiskySignIn = materialize(AADSignInEventsBeta
+            | where Timestamp > ago(1d)
+            | where isempty(DeviceTrustType)
+            | where IsManaged != 1
+            | where IsCompliant != 1
+            | where RiskLevelDuringSignIn in (50, 100)
+            | project Timestamp, ReportId, IPAddress, AccountUpn, AccountObjectId, SessionId, Country, State, City);
+            let suspiciousSignInUsers = successfulRiskySignIn
+            | distinct AccountObjectId;
+            let suspiciousSignInIPs = successfulRiskySignIn
+            | distinct IPAddress;
+            let suspiciousSignInCities = successfulRiskySignIn
+            | distinct City;
+            CloudAppEvents
+            | where Timestamp > ago(1d)
+            | where ActionType == "MailItemsAccessed"
+            | where AccountObjectId in (suspiciousSignInUsers)
+            | where IPAddress !in (suspiciousSignInIPs)
+            | where City !in (suspiciousSignInCities)
+            | join kind=inner successfulRiskySignIn on AccountObjectId
+            | where (Timestamp - Timestamp1) between (-5min .. 5min)
+            | extend folders = RawEventData.Folders
+            | mv-expand folders
+            | extend items = folders.FolderItems
+            | mv-expand items
+            | extend InternetMessageId = tostring(items.InternetMessageId)
+            | project Timestamp, ReportId, IPAddress, InternetMessageId, AccountObjectId, SessionId, Country, State, City
+
+      - Name: AgentHuntTopMaliciousURLDomains
+        DisplayName: "AgentHunt - Top 10 Malicious URL Domains"
+        Description: Identifies the top 10 URL domains associated with phishing or spam campaigns using URL-based detection methods in Defender for Office 365.
+        Settings:
+          Target: Sentinel
+          TenantId: "<YOUR_TENANT_ID>"
+          SubscriptionId: "<YOUR_SUBSCRIPTION_ID>"
+          ResourceGroupName: "<YOUR_RESOURCE_GROUP_NAME>"
+          WorkspaceName: "<YOUR_WORKSPACE_NAME>"
+          Template: |-
+            EmailEvents 
+            | where ThreatTypes != "" 
+            | extend detection= parse_json(DetectionMethods) 
+            | extend Spam = tostring(detection.Spam) 
+            | extend Phish = tostring(detection.Phish) 
+            | where (Spam == '["URL malicious reputation"]') or 
+                    (Phish == '["URL malicious reputation"]') or 
+                    (Phish == '["URL detonation reputation"]') or 
+                    (Phish == '["URL detonation"]') 
+            | join EmailUrlInfo on NetworkMessageId
+            | summarize total=count() by UrlDomain 
+            | top 10 by total 
+            | render columnchart
+
+      - Name: AgentHuntTop10PercentAttackedUsers
+        DisplayName: "AgentHunt - Top 10% Most Attacked Users"
+        Description: Identifies users who are in the top 10% of recipients of malicious or suspicious emails based on Defender for Office 365 detections.
+        Settings:
+          Target: Sentinel
+          TenantId: "<YOUR_TENANT_ID>"
+          SubscriptionId: "<YOUR_SUBSCRIPTION_ID>"
+          ResourceGroupName: "<YOUR_RESOURCE_GROUP_NAME>"
+          WorkspaceName: "<YOUR_WORKSPACE_NAME>"
+          Template: |-
+            let topTargeted = toscalar(
+              EmailEvents 
+              | where DetectionMethods != "" 
+              | summarize total=count() by RecipientEmailAddress 
+              | summarize percentiles(total, 90)
+            ); 
+            EmailEvents 
+            | where DetectionMethods != "" 
+            | summarize total=count() by RecipientEmailAddress 
+            | where total >= topTargeted 
+            | order by total desc
+
+      - Name: AgentHuntTopMaliciousSenders
+        DisplayName: "AgentHunt - Top 100 Malicious Email Senders"
+        Description: Identifies the top 100 sender email addresses associated with phishing or malware attacks detected by Defender for Office 365 in the past 30 days.
+        Settings:
+          Target: Sentinel
+          TenantId: "<YOUR_TENANT_ID>"
+          SubscriptionId: "<YOUR_SUBSCRIPTION_ID>"
+          ResourceGroupName: "<YOUR_RESOURCE_GROUP_NAME>"
+          WorkspaceName: "<YOUR_WORKSPACE_NAME>"
+          Template: |-
+            EmailEvents
+            | where Timestamp > ago(30d)
+            | where ThreatTypes has "Phish" or ThreatTypes has "Malware"
+            | summarize total=count() by SenderMailFromAddress
+            | top 100 by total
+
+      - Name: AgentHuntTopSenders
+        DisplayName: "AgentHunt - Top 100 Email Senders"
+        Description: Identifies the top 100 sender email addresses based on email volume within the last 30 days across the organization.
+        Settings:
+          Target: Sentinel
+          TenantId: "<YOUR_TENANT_ID>"
+          SubscriptionId: "<YOUR_SUBSCRIPTION_ID>"
+          ResourceGroupName: "<YOUR_RESOURCE_GROUP_NAME>"
+          WorkspaceName: "<YOUR_WORKSPACE_NAME>"
+          Template: |-
+            EmailEvents 
+            | where Timestamp > ago(30d)
+            | summarize mailCountBySender = count() by SenderMailFromAddress 
+            | top 100 by mailCountBySender
+
+      - Name: AgentHuntTopExternalMaliciousSenders
+        DisplayName: "AgentHunt - Top External Malicious Email Senders"
+        Description: Identifies top external senders of inbound emails containing malware or phishing attempts in the last 30 days.
+        Settings:
+          Target: Sentinel
+          TenantId: "<YOUR_TENANT_ID>"
+          SubscriptionId: "<YOUR_SUBSCRIPTION_ID>"
+          ResourceGroupName: "<YOUR_RESOURCE_GROUP_NAME>"
+          WorkspaceName: "<YOUR_WORKSPACE_NAME>"
+          Template: |-
+            EmailEvents 
+            | where Timestamp > ago(30d) 
+            | where EmailDirection == "Inbound" 
+            | summarize total=count() by SenderFromAddress 
+            | top 100 by total
+
+      - Name: AgentHuntTopAdminOverridePolicies
+        DisplayName: "AgentHunt - Top Policies Performing Admin Overrides"
+        Description: Identifies top policies that have allowed emails via Org-level admin overrides in the last 30 days.
+        Settings:
+          Target: Sentinel
+          TenantId: "<YOUR_TENANT_ID>"
+          SubscriptionId: "<YOUR_SUBSCRIPTION_ID>"
+          ResourceGroupName: "<YOUR_RESOURCE_GROUP_NAME>"
+          WorkspaceName: "<YOUR_WORKSPACE_NAME>"
+          Template: |-
+            EmailEvents  
+            | where Timestamp > ago(30d) 
+              and OrgLevelPolicy != "" 
+              and OrgLevelAction == "Allow"
+            | summarize total=count() by OrgLevelPolicy
+            | top 10 by total
+
+      - Name: AgentHuntTopUserOverridePolicies
+        DisplayName: "AgentHunt - Top Policies Performing User Overrides"
+        Description: Identifies top user-level policies that have allowed emails via user overrides in the last 30 days.
+        Settings:
+          Target: Sentinel
+          TenantId: "<YOUR_TENANT_ID>"
+          SubscriptionId: "<YOUR_SUBSCRIPTION_ID>"
+          ResourceGroupName: "<YOUR_RESOURCE_GROUP_NAME>"
+          WorkspaceName: "<YOUR_WORKSPACE_NAME>"
+          Template: |-
+            EmailEvents
+            | where Timestamp > ago(30d)
+              and UserLevelPolicy != ""
+              and UserLevelAction == "Allow"
+            | summarize total=count() by UserLevelPolicy
+            | top 10 by total
+
+      - Name: AgentHuntTopTargetedUsers
+        DisplayName: "AgentHunt - Top Targeted Users"
+        Description: Identifies users most frequently targeted with malware or phishing emails in the last 30 days.
+        Settings:
+          Target: Sentinel
+          TenantId: "<YOUR_TENANT_ID>"
+          SubscriptionId: "<YOUR_SUBSCRIPTION_ID>"
+          ResourceGroupName: "<YOUR_RESOURCE_GROUP_NAME>"
+          WorkspaceName: "<YOUR_WORKSPACE_NAME>"
+          Template: |-
+            EmailEvents 
+            | where Timestamp > ago(30d) 
+              and (ThreatTypes has "Malware" or ThreatTypes has "Phish") 
+            | summarize total=count() by RecipientEmailAddress 
+            | top 100 by total
+
+      - Name: AgentHuntTotalZAPCount
+        DisplayName: "AgentHunt - Total ZAP Event Count"
+        Description: Calculates the total number of ZAP (Zero-hour Auto Purge) events, including phishing and malware ZAP actions in the past 30 days.
+        Settings:
+          Target: Sentinel
+          TenantId: "<YOUR_TENANT_ID>"
+          SubscriptionId: "<YOUR_SUBSCRIPTION_ID>"
+          ResourceGroupName: "<YOUR_RESOURCE_GROUP_NAME>"
+          WorkspaceName: "<YOUR_WORKSPACE_NAME>"
+          Template: |-
+            EmailPostDeliveryEvents 
+            | where Timestamp > ago(30d) 
+              and (ActionType == "Phish ZAP" or ActionType == "Malware ZAP") 
+            | count
+
+      - Name: AgentHuntUrlClickActionSummary
+        DisplayName: "AgentHunt - URL Clicks by Action Type"
+        Description: Summarizes the count of URL clicks based on action types such as allowed, blocked, pending verdict, error pages, and clicked-through activity.
+        Settings:
+          Target: Sentinel
+          TenantId: "<YOUR_TENANT_ID>"
+          SubscriptionId: "<YOUR_SUBSCRIPTION_ID>"
+          ResourceGroupName: "<YOUR_RESOURCE_GROUP_NAME>"
+          WorkspaceName: "<YOUR_WORKSPACE_NAME>"
+          Template: |-
+            UrlClickEvents 
+            | extend UrlBlocked = ActionType has_any("ClickBlocked") 
+            | extend UrlAllowed = ActionType has_any('ClickAllowed') 
+            | extend UrlPendingVerdict = ActionType has_any('UrlScanInProgress') 
+            | extend ErrorPage = ActionType has_any('UrlErrorPage') 
+            | summarize 
+                Blocked = countif(UrlBlocked), 
+                Allowed = countif(UrlAllowed), 
+                PendingVerdict = countif(UrlPendingVerdict), 
+                Error = countif(ErrorPage), 
+                ClickedThrough = countif(IsClickedThrough)
+
+      - Name: AgentHuntUrlClickOnZAPEmail
+        DisplayName: "AgentHunt - URL Clicks on ZAP'd Emails"
+        Description: Identifies URL click activity on emails that were removed post-delivery by Zero-hour Auto Purge (ZAP) due to malicious URLs.
+        Settings:
+          Target: Sentinel
+          TenantId: "<YOUR_TENANT_ID>"
+          SubscriptionId: "<YOUR_SUBSCRIPTION_ID>"
+          ResourceGroupName: "<YOUR_RESOURCE_GROUP_NAME>"
+          WorkspaceName: "<YOUR_WORKSPACE_NAME>"
+          Template: |-
+            AlertInfo
+            | where Title cont
+            ains "Email messages containing malicious URL removed after delivery" and Timestamp > ago(7d)
+            | join kind=inner (
+                AlertEvidence
+                | where EntityType == "MailMessage"
+              ) on AlertId 
+            | join UrlClickEvents on NetworkMessageId
+
+      - Name: AgentHuntMaliciousUrlClickDetails
+        DisplayName: "AgentHunt - URL Clicks Triggering Malicious URL Alerts"
+        Description: Correlates alert data with email and URL click telemetry to identify URL clicks that triggered the 'Potentially malicious URL click' alert in the last 30 days.
+        Settings:
+          Target: Sentinel
+          TenantId: "<YOUR_TENANT_ID>"
+          SubscriptionId: "<YOUR_SUBSCRIPTION_ID>"
+          ResourceGroupName: "<YOUR_RESOURCE_GROUP_NAME>"
+          WorkspaceName: "<YOUR_WORKSPACE_NAME>"
+          Template: |-
+            AlertInfo
+            | where Title contains "Potentially malicious" and Timestamp > ago(30d)
+            | join kind=inner (
+                AlertEvidence 
+                | where EntityType == "MailMessage"
+              ) on AlertId 
+            | join kind=inner UrlClickEvents on NetworkMessageId
+
+      - Name: AgentHuntUserClickedThroughEvents
+        DisplayName: "AgentHunt - User Clicked Through Malicious URLs"
+        Description: Identifies users who clicked through phishing URLs even after a warning, highlighting potential risky behavior.
+        Settings:
+          Target: Sentinel
+          TenantId: "<YOUR_TENANT_ID>"
+          SubscriptionId: "<YOUR_SUBSCRIPTION_ID>"
+          ResourceGroupName: "<YOUR_RESOURCE_GROUP_NAME>"
+          WorkspaceName: "<YOUR_WORKSPACE_NAME>"
+          Template: |-
+            UrlClickEvents 
+            | where ActionType == "ClickAllowed" or IsClickedThrough != "0" 
+            | where ThreatTypes has "Phish" 
+            | summarize by ReportId, IsClickedThrough, AccountUpn, NetworkMessageId, ThreatTypes
+      
+      - Name: AgentHuntUserClicksOnMaliciousInboundEmails
+        DisplayName: "AgentHunt - User Clicks on Malicious Inbound Emails"
+        Description: Identifies users who clicked on suspicious URLs in inbound emails detected as malware or phishing by Microsoft Defender for Office 365.
+        Settings:
+          Target: Sentinel
+          TenantId: "<YOUR_TENANT_ID>"
+          SubscriptionId: "<YOUR_SUBSCRIPTION_ID>"
+          ResourceGroupName: "<YOUR_RESOURCE_GROUP_NAME>"
+          WorkspaceName: "<YOUR_WORKSPACE_NAME>"
+          Template: |-
+            let UrlClicked = (
+              UrlClickEvents
+              | where ActionType == "ClickAllowed" or IsClickedThrough != "0"
+              | extend Device_IPv4 = IPAddress
+              | project ActionType, Device_IPv4, Url, UrlChain, IPAddress, NetworkMessageId
+            );
+            EmailEvents
+            | where Timestamp > ago(30d)
+            | where isnotempty(ThreatTypes) and EmailDirection == "Inbound"
+            | where ThreatTypes has_any ("Malware", "Phish")
+            | extend SenderFromAddress_IPv4 = strcat(SenderFromAddress, ", ", SenderIPv4)
+            | join kind = inner UrlClicked on NetworkMessageId
+            | project Timestamp, NetworkMessageId, Subject, SenderFromAddress_IPv4, RecipientEmailAddress, ThreatTypes, ActionType, Url, UrlChain, Device_IPv4, LatestDeliveryLocation, LatestDeliveryAction, EmailAction, EmailActionPolicy
+
+      - Name: AgentHuntUserClicksOnPhishingURLs
+        DisplayName: "AgentHunt - User Clicks on Phishing URLs in Emails"
+        Description: Detects users who clicked on URLs in phishing emails, including emails delivered due to admin/user override actions.
+        Settings:
+          Target: Sentinel
+          TenantId: "<YOUR_TENANT_ID>"
+          SubscriptionId: "<YOUR_SUBSCRIPTION_ID>"
+          ResourceGroupName: "<YOUR_RESOURCE_GROUP_NAME>"
+          WorkspaceName: "<YOUR_WORKSPACE_NAME>"
+          Template: |-
+            UrlClickEvents 
+            | where ThreatTypes has "Phish" 
+            | join EmailEvents on NetworkMessageId, $left.AccountUpn == $right.RecipientEmailAddress 
+            | project Timestamp, Url, ActionType, AccountUpn, ReportId, NetworkMessageId, ThreatTypes, IsClickedThrough, DeliveryLocation, OrgLevelAction, UserLevelAction
+
+      - Name: AgentHuntUserOverrides
+        DisplayName: "AgentHunt - User Overrides on Malicious Emails"
+        Description: Reviews the count of malicious emails that were delivered due to user-level override actions in Microsoft Defender for Office 365.
+        Settings:
+          Target: Sentinel
+          TenantId: "<YOUR_TENANT_ID>"
+          SubscriptionId: "<YOUR_SUBSCRIPTION_ID>"
+          ResourceGroupName: "<YOUR_RESOURCE_GROUP_NAME>"
+          WorkspaceName: "<YOUR_WORKSPACE_NAME>"
+          Template: |-
+            EmailEvents
+            | where DeliveryLocation == "Inbox/folder" 
+            | where isnotempty(ThreatTypes) and UserLevelAction == "Allow" 
+            | count

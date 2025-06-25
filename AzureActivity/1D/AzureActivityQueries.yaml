@@ -1,0 +1,257 @@
+Descriptor:
+  Name: AgentHunt.SignInLogs
+  DisplayName: "AgentHunt - Sign-In Log Threat Hunts"
+  Description: KQL skills targeting suspicious sign-in activity including brute-force, credential abuse, and anomalous geographic access.
+SkillGroups:
+  - Format: KQL
+    Skills:
+      - Name: AgentHuntSuspectedBruteForceInvestigation
+        DisplayName: "AgentHunt - Suspected Brute Force Attack"
+        Description: Summarizes sign-in failures and successes over 24 hours. Flags users with more than 100 failures and at least one success, indicating potential brute-force or password spray behavior.
+        Settings:
+          Target: Sentinel
+          TenantId: "<YOUR_TENANT_ID>"
+          SubscriptionId: "<YOUR_SUBSCRIPTION_ID>"
+          ResourceGroupName: "<YOUR_RESOURCE_GROUP_NAME>"
+          WorkspaceName: "<YOUR_WORKSPACE_NAME>"
+          Template: |-
+            let successCodes = dynamic(["0", "50125", "50140", "70043", "70044"]);
+            let aadFunc = (tableName:string){
+              table(tableName)
+              | extend FailureOrSuccess = iff(ResultType in (successCodes), "Success", "Failure")
+              | summarize FailureCount = countif(FailureOrSuccess=="Failure"), SuccessCount = countif(FailureOrSuccess=="Success") by bin(TimeGenerated, 1h), UserPrincipalName, UserDisplayName, IPAddress
+              | where FailureCount > 100
+              | where SuccessCount > 0
+              | order by UserPrincipalName, TimeGenerated asc
+              | extend AccountCustomEntity = UserPrincipalName, IPCustomEntity = IPAddress
+            };
+            let aadSignin = aadFunc("SigninLogs");
+            let aadNonInt = aadFunc("AADNonInteractiveUserSignInLogs");
+            union isfuzzy=true aadSignin, aadNonInt
+
+      - Name: AgentHuntAnalyticsRuleAdminOps
+        DisplayName: "AgentHunt - Sentinel Analytics Rule Admin Operations"
+        Description: Identifies Microsoft Sentinel Analytics Rule administrative operations like rule creation, update, or deletion.
+        Settings:
+          Target: Sentinel
+          TenantId: "<YOUR_TENANT_ID>"
+          SubscriptionId: "<YOUR_SUBSCRIPTION_ID>"
+          ResourceGroupName: "<YOUR_RESOURCE_GROUP_NAME>"
+          WorkspaceName: "<YOUR_WORKSPACE_NAME>"
+          Template: |-
+            let opValues = dynamic(["Microsoft.SecurityInsights/alertRules/write", "Microsoft.SecurityInsights/alertRules/delete"]);
+            AzureActivity
+            | where CategoryValue =~ "Administrative"
+            | where OperationNameValue in~ (opValues)
+            | where ActivitySubstatusValue in~ ("Created", "OK")
+            | sort by TimeGenerated desc
+            | extend Name = tostring(split(Caller,'@',0)[0]), UPNSuffix = tostring(split(Caller,'@',1)[0])
+            | extend Account_0_Name = Name
+            | extend Account_0_UPNSuffix = UPNSuffix
+            | extend IP_0_Address = CallerIpAddress
+
+      - Name: AgentHuntVNetSubnetAdminOps
+        DisplayName: "AgentHunt - VNet Subnet Admin Operations"
+        Description: Identifies administrative operations for Azure Virtual Network Subnets, including creation, update, or deletion activities.
+        Settings:
+          Target: Sentinel
+          TenantId: "<YOUR_TENANT_ID>"
+          SubscriptionId: "<YOUR_SUBSCRIPTION_ID>"
+          ResourceGroupName: "<YOUR_RESOURCE_GROUP_NAME>"
+          WorkspaceName: "<YOUR_WORKSPACE_NAME>"
+          Template: |-
+            let opValues = dynamic(["Microsoft.Network/virtualNetworks/subnets/write", "Microsoft.Network/virtualNetworks/subnets/delete"]);
+            AzureActivity
+            | where CategoryValue =~ "Administrative"
+            | where OperationNameValue in~ (opValues)
+            | where ActivitySubstatusValue in~ ("Created", "Accepted")
+            | sort by TimeGenerated desc
+            | extend Name = tostring(split(Caller,'@',0)[0]), UPNSuffix = tostring(split(Caller,'@',1)[0])
+            | extend Account_0_Name = Name
+            | extend Account_0_UPNSuffix = UPNSuffix
+            | extend IP_0_Address = CallerIpAddress
+
+      - Name: AgentHuntVMRunCommandFromAzureIP
+        DisplayName: "AgentHunt - VM Run Command from Azure IP"
+        Description: Identifies Azure VM Run Command operations executed from Azure IP ranges. This technique has been used by NOBELIUM and may indicate privilege abuse or remote execution.
+        Settings:
+          Target: Sentinel
+          TenantId: "<YOUR_TENANT_ID>"
+          SubscriptionId: "<YOUR_SUBSCRIPTION_ID>"
+          ResourceGroupName: "<YOUR_RESOURCE_GROUP_NAME>"
+          WorkspaceName: "<YOUR_WORKSPACE_NAME>"
+          Template: |-
+            let azure_ranges = externaldata(changeNumber: string, cloud: string, values: dynamic)
+              ["https://raw.githubusercontent.com/microsoft/mstic/master/PublicFeeds/MSFTIPRanges/ServiceTags_Public.json"] with(format='multijson')
+              | mv-expand values
+              | extend Name = values.name, AddressPrefixes = values.properties.addressPrefixes
+              | where Name startswith "WindowsVirtualDesktop"
+              | mv-expand AddressPrefixes
+              | summarize by tostring(AddressPrefixes);
+            AzureActivity
+            | where TimeGenerated > ago(30d)
+            | where OperationNameValue == "Microsoft.Compute/virtualMachines/runCommand/action"
+            | where Authorization has "virtualMachines"
+            | summarize StartTime = min(TimeGenerated), EndTime = max(TimeGenerated), max(CallerIpAddress), make_list(ActivityStatusValue) by CorrelationId, Authorization, Caller
+            | where list_ActivityStatusValue has "Succeeded"
+            | extend Authorization_d = parse_json(Authorization)
+            | extend Scope = Authorization_d.scope
+            | extend Scope_s = split(Scope, "/")
+            | extend Subscription = tostring(Scope_s[2])
+            | extend VirtualMachineName = tostring(Scope_s[-1])
+            | project StartTime, EndTime, Subscription, VirtualMachineName, CorrelationId, Caller, CallerIpAddress = max_CallerIpAddress
+            | evaluate ipv4_lookup(azure_ranges, CallerIpAddress, AddressPrefixes)
+            | extend IP_0_Address = CallerIpAddress
+
+      - Name: AgentHuntAnomalousResourceCreation
+        DisplayName: "AgentHunt - Anomalous Volume of Resource Creation"
+        Description: Detects users creating an unusually high number of Azure resources or deployments over the past 7 days. Useful for spotting suspicious provisioning activity.
+        Settings:
+          Target: Sentinel
+          TenantId: "<YOUR_TENANT_ID>"
+          SubscriptionId: "<YOUR_SUBSCRIPTION_ID>"
+          ResourceGroupName: "<YOUR_RESOURCE_GROUP_NAME>"
+          WorkspaceName: "<YOUR_WORKSPACE_NAME>"
+          Template: |-
+            AzureActivity
+            | where OperationNameValue in~ ("microsoft.compute/virtualMachines/write", "microsoft.resources/deployments/write")
+            | where ActivityStatusValue == "Succeeded"
+            | make-series dcount(ResourceId) default=0 on EventSubmissionTimestamp in range(ago(7d), now(), 1d) by Caller
+            | extend Name = tostring(split(Caller,'@',0)[0]), UPNSuffix = tostring(split(Caller,'@',1)[0])
+            | extend Account_0_Name = Name
+            | extend Account_0_UPNSuffix = UPNSuffix
+
+      - Name: AgentHuntMLWriteOperations
+        DisplayName: "AgentHunt - Azure Machine Learning Write Operations"
+        Description: Displays users performing write operations on Azure Machine Learning Services and identifies their common source IP addresses. Useful for detecting unauthorized modifications.
+        Settings:
+          Target: Sentinel
+          TenantId: "<YOUR_TENANT_ID>"
+          SubscriptionId: "<YOUR_SUBSCRIPTION_ID>"
+          ResourceGroupName: "<YOUR_RESOURCE_GROUP_NAME>"
+          WorkspaceName: "<YOUR_WORKSPACE_NAME>"
+          Template: |-
+            AzureActivity
+            | where ResourceProviderValue == "MICROSOFT.MACHINELEARNINGSERVICES"
+            | extend SCOPE = tostring(parse_json(Authorization).scope)
+            | extend subname = split(Hierarchy, "/")
+            | extend ['Subscription Name'] = subname[-2], ['Subscription ID'] = subname[-1]
+            | extend Properties = parse_json(Properties)
+            | extend Properties_entity = tostring(Properties.entity)
+            | where isnotempty(Properties_entity)
+            | where OperationNameValue contains "write"
+            | where OperationNameValue !contains "MICROSOFT.AUTHORIZATION/ROLEASSIGNMENTS/WRITE"
+            | extend LLM = tostring(split(Properties_entity, "/")[-1])
+            | distinct TimeGenerated, tostring(['Subscription Name']), ResourceGroup, tostring(['Subscription ID']), Caller, CallerIpAddress, OperationNameValue, LLM, _ResourceId
+
+      - Name: AgentHuntStorageKeyEnumeration
+        DisplayName: "AgentHunt - Azure Storage Key Enumeration"
+        Description: Detects Azure Storage account key enumeration from unexpected IP addresses. Helps identify potential exposure of secrets or lateral movement.
+        Settings:
+          Target: Sentinel
+          TenantId: "<YOUR_TENANT_ID>"
+          SubscriptionId: "<YOUR_SUBSCRIPTION_ID>"
+          ResourceGroupName: "<YOUR_RESOURCE_GROUP_NAME>"
+          WorkspaceName: "<YOUR_WORKSPACE_NAME>"
+          Template: |-
+            AzureActivity
+            | where OperationNameValue =~ "microsoft.storage/storageaccounts/listkeys/action"
+            | where ActivityStatusValue =~ "Succeeded" 
+            | join kind= inner (
+                AzureActivity
+                | where OperationNameValue =~ "microsoft.storage/storageaccounts/listkeys/action"
+                | where ActivityStatusValue =~ "Succeeded" 
+                | project ExpectedIpAddress=CallerIpAddress, Caller 
+                | evaluate autocluster()
+            ) on Caller
+            | where CallerIpAddress != ExpectedIpAddress
+            | summarize StartTime = min(TimeGenerated), EndTime = max(TimeGenerated), ResourceIds = make_set(ResourceId,100), ResourceIdCount = dcount(ResourceId) by OperationNameValue, Caller, CallerIpAddress
+            | extend Name = tostring(split(Caller,'@',0)[0]), UPNSuffix = tostring(split(Caller,'@',1)[0])
+            | extend Account_0_Name = Name
+            | extend Account_0_UPNSuffix = UPNSuffix
+            | extend IP_0_Address = CallerIpAddress
+
+      - Name: AgentHuntSentinelWorkbookAdminOps
+        DisplayName: "AgentHunt - Sentinel Workbook Admin Operations"
+        Description: Detects administrative operations on Microsoft Sentinel Workbooks, including creation, updates, or deletions.
+        Settings:
+          Target: Sentinel
+          TenantId: "<YOUR_TENANT_ID>"
+          SubscriptionId: "<YOUR_SUBSCRIPTION_ID>"
+          ResourceGroupName: "<YOUR_RESOURCE_GROUP_NAME>"
+          WorkspaceName: "<YOUR_WORKSPACE_NAME>"
+          Template: |-
+            let opValues = dynamic(["microsoft.insights/workbooks/write", "microsoft.insights/workbooks/delete"]);
+            AzureActivity
+            | where Category =~ "Administrative"
+            | where OperationNameValue in~ (opValues)
+            | where ActivitySubstatusValue in~ ("Created", "OK")
+            | sort by TimeGenerated desc
+            | extend Name = tostring(split(Caller,'@',0)[0]), UPNSuffix = tostring(split(Caller,'@',1)[0])
+            | extend Account_0_Name = Name
+            | extend Account_0_UPNSuffix = UPNSuffix
+            | extend IP_0_Address = CallerIpAddress
+
+      - Name: AgentHuntAzureAdminFromVPS
+        DisplayName: "AgentHunt - Azure Admin Actions from VPS Providers"
+        Description: Identifies administrative Azure operations performed from IP addresses belonging to known VPS providers.
+        Settings:
+          Target: Sentinel
+          TenantId: "<YOUR_TENANT_ID>"
+          SubscriptionId: "<YOUR_SUBSCRIPTION_ID>"
+          ResourceGroupName: "<YOUR_RESOURCE_GROUP_NAME>"
+          WorkspaceName: "<YOUR_WORKSPACE_NAME>"
+          Template: |-
+            let IP_Data = (externaldata(network:string)
+            [@"https://raw.githubusercontent.com/Azure/Azure-Sentinel/master/Sample%20Data/Feeds/VPS_Networks.csv"] 
+            with (format="csv"));
+            AzureActivity
+            | where CategoryValue =~ "Administrative"
+            | evaluate ipv4_lookup(IP_Data, CallerIpAddress, network, return_unmatched = false)
+            | summarize Operations = make_set(OperationNameValue), StartTime = min(TimeGenerated), EndTime = max(TimeGenerated) by CallerIpAddress, Caller
+            | extend Name = tostring(split(Caller,'@',0)[0]), UPNSuffix = tostring(split(Caller,'@',1)[0])
+            | extend Account_0_Name = Name
+            | extend Account_0_UPNSuffix = UPNSuffix
+            | extend IP_0_Address = CallerIpAddress
+
+      - Name: AgentHuntSentinelConnectorAdminOps
+        DisplayName: "AgentHunt - Sentinel Connector Admin Operations"
+        Description: Detects administrative operations on Microsoft Sentinel data connectors, such as creation, update, or deletion.
+        Settings:
+          Target: Sentinel
+          TenantId: "<YOUR_TENANT_ID>"
+          SubscriptionId: "<YOUR_SUBSCRIPTION_ID>"
+          ResourceGroupName: "<YOUR_RESOURCE_GROUP_NAME>"
+          WorkspaceName: "<YOUR_WORKSPACE_NAME>"
+          Template: |-
+            let opValues = dynamic(["Microsoft.SecurityInsights/dataConnectors/write", "Microsoft.SecurityInsights/dataConnectors/delete"]);
+            AzureActivity
+            | where OperationNameValue in~ (opValues)
+            | where ActivitySubstatusValue in~ ("Created", "OK")
+            | sort by TimeGenerated desc
+            | extend Name = tostring(split(Caller,'@',0)[0]), UPNSuffix = tostring(split(Caller,'@',1)[0])
+            | extend Account_0_Name = Name
+            | extend Account_0_UPNSuffix = UPNSuffix
+            | extend IP_0_Address = CallerIpAddress
+
+      - Name: AgentHuntCommonDeployedResources
+        DisplayName: "AgentHunt - Common Deployed Azure Resources"
+        Description: Identifies commonly deployed Azure resources across time to support anomaly detection and triage of suspicious deployments.
+        Settings:
+          Target: Sentinel
+          TenantId: "<YOUR_TENANT_ID>"
+          SubscriptionId: "<YOUR_SUBSCRIPTION_ID>"
+          ResourceGroupName: "<YOUR_RESOURCE_GROUP_NAME>"
+          WorkspaceName: "<YOUR_WORKSPACE_NAME>"
+          Template: |-
+            AzureActivity
+            | where OperationNameValue has_any (@"deployments/write", @"virtualMachines/write")  
+            | where ActivityStatusValue =~ "Succeeded"
+            | summarize by bin(TimeGenerated,1d), Resource, ResourceGroup, ResourceId, OperationNameValue, Caller
+            | evaluate basket()
+            | where isnotempty(Caller) and isnotempty(Resource) and isnotempty(TimeGenerated)
+            | order by Percent desc, TimeGenerated desc
+            | extend Name = tostring(split(Caller,'@',0)[0]), UPNSuffix = tostring(split(Caller,'@',1)[0])
+            | extend Account_0_Name = Name
+            | extend Account_0_UPNSuffix = UPNSuffix
+            | extend AzureResource_0_ResourceId = ResourceId

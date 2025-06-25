@@ -32,6 +32,7 @@ Edit
 ## 🚀 Getting Started
 
 To deploy a skill:
+
 1. Replace the placeholder values in the `Settings` block:
    - `<YOUR_TENANT_ID>`
    - `<YOUR_SUBSCRIPTION_ID>`
@@ -40,7 +41,7 @@ To deploy a skill:
 
 2. Import the skill into your Security Copilot plugin setup.
 
-3. Use the skill in natural language within Security Copilot:
+3. Use the skill in natural language within Security Copilot, such as:
    > "Show me the top 10 malicious URL domains from the last 30 days."
 
 ## 🧠 Example Skill

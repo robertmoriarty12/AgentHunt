@@ -1,0 +1,758 @@
+Descriptor:
+  Name: AgentHunt.SignInLogs
+  DisplayName: "AgentHunt - Sign-In Log Threat Hunts"
+  Description: KQL skills targeting suspicious sign-in activity including brute-force, credential abuse, and anomalous geographic access.
+SkillGroups:
+  - Format: KQL
+    Skills:
+      - Name: AgentHuntSuspectedBruteForceInvestigation
+        DisplayName: "AgentHunt - Suspected Brute Force Attack"
+        Description: Summarizes sign-in failures and successes over 24 hours. Flags users with more than 100 failures and at least one success, indicating potential brute-force or password spray behavior.
+        Settings:
+          Target: Sentinel
+          TenantId: "<YOUR_TENANT_ID>"
+          SubscriptionId: "<YOUR_SUBSCRIPTION_ID>"
+          ResourceGroupName: "<YOUR_RESOURCE_GROUP_NAME>"
+          WorkspaceName: "<YOUR_WORKSPACE_NAME>"
+          Template: |-
+            let successCodes = dynamic(["0", "50125", "50140", "70043", "70044"]);
+            let aadFunc = (tableName:string){
+              table(tableName)
+              | extend FailureOrSuccess = iff(ResultType in (successCodes), "Success", "Failure")
+              | summarize FailureCount = countif(FailureOrSuccess=="Failure"), SuccessCount = countif(FailureOrSuccess=="Success") by bin(TimeGenerated, 1h),UserPrincipalName, UserDisplayName, IPAddress
+              | where FailureCount > 100
+              | where SuccessCount > 0
+              | order by UserPrincipalName, TimeGenerated asc
+              | extend AccountCustomEntity = UserPrincipalName, IPCustomEntity = IPAddress
+            };
+            let aadSignin = aadFunc("SigninLogs");
+            let aadNonInt = aadFunc("AADNonInteractiveUserSignInLogs");
+            union isfuzzy=true aadSignin, aadNonInt
+
+      - Name: AgentHuntAdminCrossTenantSignIn
+        DisplayName: "AgentHunt - Admin Cross-Tenant Sign-In"
+        Description: Detects successful authentications by privileged users into other Microsoft Entra ID tenants. Investigate for legitimacy and potential initial access vectors.  
+        Ref: https://docs.microsoft.com/azure/active-directory/fundamentals/security-operations-user-accounts#monitoring-for-successful-unusual-sign-ins
+        Settings:
+          Target: Sentinel
+          TenantId: "<YOUR_TENANT_ID>"
+          SubscriptionId: "<YOUR_SUBSCRIPTION_ID>"
+          ResourceGroupName: "<YOUR_RESOURCE_GROUP_NAME>"
+          WorkspaceName: "<YOUR_WORKSPACE_NAME>"
+          Template: |-
+            let admin_users = (IdentityInfo
+              | summarize arg_max(TimeGenerated, *) by AccountUPN
+              | where AssignedRoles contains "admin"
+              | summarize by tolower(AccountUPN));
+            SigninLogs
+            | where TimeGenerated between(ago(14d)..ago(1d))
+            | where ResultType == 0
+            | where tolower(UserPrincipalName) in (admin_users)
+            | where HomeTenantId != ResourceTenantId
+            | summarize by UserPrincipalName, ResourceTenantId
+            | join kind=rightanti (
+                SigninLogs
+                | where TimeGenerated > ago(1d)
+                | where ResultType == 0
+                | where tolower(UserPrincipalName) in (admin_users)
+                | where HomeTenantId != ResourceTenantId
+                | where isnotempty(HomeTenantId) and isnotempty(ResourceTenantId)
+              ) on UserPrincipalName, ResourceTenantId
+            | where RiskLevelAggregated != "none"
+            | extend AccountCustomEntity = UserPrincipalName
+
+      - Name: AgentHuntAnomalousSignInLocation
+        DisplayName: "AgentHunt - Anomalous Sign-In Location by App"
+        Description: Detects sudden changes in user location patterns by app. Useful for identifying account compromise potentially tied to application misuse.
+        Settings:
+          Target: Sentinel
+          TenantId: "<YOUR_TENANT_ID>"
+          SubscriptionId: "<YOUR_SUBSCRIPTION_ID>"
+          ResourceGroupName: "<YOUR_RESOURCE_GROUP_NAME>"
+          WorkspaceName: "<YOUR_WORKSPACE_NAME>"
+          Template: |-
+            SigninLogs 
+            | extend locationString = strcat(tostring(LocationDetails["countryOrRegion"]), "/", 
+                tostring(LocationDetails["state"]), "/", tostring(LocationDetails["city"]), ";") 
+            | project TimeGenerated, AppDisplayName, UserPrincipalName, locationString 
+            | make-series dLocationCount = dcount(locationString) on TimeGenerated step 1d
+              by UserPrincipalName, AppDisplayName 
+            | extend (RSquare, Slope, Variance, RVariance, Interception, LineFit) = series_fit_line(dLocationCount) 
+            | top 3 by Slope desc
+            | extend timestamp = TimeGenerated, AccountCustomEntity = UserPrincipalName 
+            | render timechart
+
+      - Name: AgentHuntAnomalousSignInLocationWithDetails
+        DisplayName: "AgentHunt - Anomalous Sign-In Location (Tabular with Sign-In Details)"
+        Description: Identifies anomalous user location changes and joins back to sign-in data for review of location diversity over time in tabular form.
+        Settings:
+          Target: Sentinel
+          TenantId: "<YOUR_TENANT_ID>"
+          SubscriptionId: "<YOUR_SUBSCRIPTION_ID>"
+          ResourceGroupName: "<YOUR_RESOURCE_GROUP_NAME>"
+          WorkspaceName: "<YOUR_WORKSPACE_NAME>"
+          Template: |-
+            SigninLogs 
+            | extend locationString = strcat(tostring(LocationDetails["countryOrRegion"]), "/", 
+                tostring(LocationDetails["state"]), "/", tostring(LocationDetails["city"]), ";") 
+            | project TimeGenerated, AppDisplayName , UserPrincipalName, locationString 
+            | make-series dLocationCount = dcount(locationString) on TimeGenerated step 1d 
+              by UserPrincipalName, AppDisplayName 
+            | extend (RSquare,Slope,Variance,RVariance,Interception,LineFit)=series_fit_line(dLocationCount) 
+            | top 3 by Slope desc  
+            | join kind=inner (
+                SigninLogs
+                | extend locationString = strcat(tostring(LocationDetails["countryOrRegion"]), "/", 
+                    tostring(LocationDetails["state"]), "/", tostring(LocationDetails["city"]), ";")
+                | summarize locationList = makeset(locationString), threeDayWindowLocationCount=dcount(locationString) 
+                  by AppDisplayName, UserPrincipalName, timerange=bin(TimeGenerated, 3d)
+              ) on AppDisplayName, UserPrincipalName
+            | order by UserPrincipalName, timerange asc
+            | project timerange, AppDisplayName , UserPrincipalName, threeDayWindowLocationCount, locationList 
+            | order by AppDisplayName, UserPrincipalName, timerange asc
+            | extend timestamp = timerange, AccountCustomEntity = UserPrincipalName
+      
+      - Name: AgentHuntInactiveOrNewAccountSignin
+        DisplayName: "AgentHunt - Inactive or New Account Sign-ins"
+        Description: Detects first-time sign-ins from inactive or unexpected accounts using UEBA enrichment. Excludes newly created users in the last 7 days to reduce noise.
+        Settings:
+          Target: Sentinel
+          TenantId: "<YOUR_TENANT_ID>"
+          SubscriptionId: "<YOUR_SUBSCRIPTION_ID>"
+          ResourceGroupName: "<YOUR_RESOURCE_GROUP_NAME>"
+          WorkspaceName: "<YOUR_WORKSPACE_NAME>"
+          Template: |-
+            let starttime = todatetime('{{StartTimeISO}}');
+            let endtime = todatetime('{{EndTimeISO}}');
+            let lookback = starttime - 14d;
+            let midtime = starttime - 7d;
+            let SigninsSummary = SigninLogs
+            | where TimeGenerated between(starttime..endtime)
+            | where ResultType == 0
+            | summarize StartTime = min(TimeGenerated), EndTime = max(TimeGenerated), SigninLogs_ItemIds = make_set(_ItemId), loginCountToday=count() by UserPrincipalName, UserId, UserType, IPAddress
+            | join kind=leftanti (
+                SigninLogs
+                | where TimeGenerated between(lookback..starttime)
+                | where ResultType == 0
+                | summarize by UserId
+            ) on UserId;
+            let onlyInactive = SigninsSummary | summarize make_set(UserPrincipalName);
+            let SigninsWithUEBA =
+            BehaviorAnalytics
+            | where TimeGenerated between(starttime..endtime)
+            | where ActionType in ('Sign-in','InteractiveLogon')
+            | where UserPrincipalName in~ (onlyInactive)
+            | extend ActivityInsights = parse_xml(ActivityInsights)
+            | where ActivityInsights matches regex '\"FirstTimeUser([A-Za-z0-9]+)\":\"True\"'
+            | where (not(ActivityInsights.FirstTimeUserUsedApp == 'True' and ActivityInsights.AppUncommonlyUsedAmongPeers == 'False') or InvestigationPriority > 0)
+            | where (not(ActivityInsights.FirstTimeUserConnectedViaBrowser == 'True' and ActivityInsights.BrowserUncommonlyUsedAmongPeers == 'False') or InvestigationPriority > 0)
+            | where (not(ActivityInsights.FirstTimeUserAccessedResource == 'True' and ActivityInsights.ResourceUncommonlyUsedAmongPeers == 'False') or InvestigationPriority > 0)
+            | where (not(ActivityInsights.FirstTimeUserConnectedViaISP == 'True' and (ActivityInsights.ISPUncommonlyUsedInTenant == 'False' or ActivityInsights.ISPUncommonlyUsedAmongPeers == 'False')) or InvestigationPriority > 0)
+            | extend UEBA_Insights = pack_dictionary("TimeGenerated", TimeGenerated, "ActivityInsights", ActivityInsights, "UsersInsights", UsersInsights, "DevicesInsights", DevicesInsights)
+            | summarize UEBA_ItemIds = make_set(_ItemId), UEBA_SourceRecordIds = make_set(SourceRecordId), UEBA_Insights = make_set(UEBA_Insights) by
+                UEBA_UserPrincipalName = UserPrincipalName, JoinedWithType = Type, UEBA_ActionType = ActionType, UEBA_SourceIPAddress = SourceIPAddress, UEBA_SourceIPLocation = SourceIPLocation, UEBA_InvestigationPriority = InvestigationPriority
+            | extend UEBA_Info = pack_dictionary("UEBA_Insights", UEBA_Insights, "UEBA_ItemIds", UEBA_ItemIds, "UEBA_SourceRecordIds", UEBA_SourceRecordIds)
+            | project-away UEBA_ItemIds, UEBA_SourceRecordIds, UEBA_Insights
+            | join kind=inner (SigninsSummary) on $left.UEBA_UserPrincipalName == $right.UserPrincipalName, $left.UEBA_SourceIPAddress == $right.IPAddress
+            | project-reorder StartTime, EndTime, UserPrincipalName, UserId, IPAddress, UserType, loginCountToday, JoinedWithType;
+            SigninsWithUEBA 
+            | join kind= leftanti (
+                AuditLogs
+                | where TimeGenerated between(midtime..endtime)
+                | where OperationName == "Add user"
+                | summarize by NewUserId = tostring(TargetResources[0].id)
+            ) on $left.UserId == $right.NewUserId
+            | extend timestamp = StartTime, AccountCustomEntity = UserPrincipalName, IPCustomEntity = IPAddress
+      
+      - Name: AgentHuntLoginSpikeWithFailureRate
+        DisplayName: "AgentHunt - Login Spike with Failure Rate"
+        Description: Uses anomaly detection on sign-in volume to detect spikes. Flags periods with both login surges and elevated failure rates, suggesting attack activity.
+        Settings:
+          Target: Sentinel
+          TenantId: "<YOUR_TENANT_ID>"
+          SubscriptionId: "<YOUR_SUBSCRIPTION_ID>"
+          ResourceGroupName: "<YOUR_RESOURCE_GROUP_NAME>"
+          WorkspaceName: "<YOUR_WORKSPACE_NAME>"
+          Template: |-
+            let starttime = todatetime('{{StartTimeISO}}');
+            let endtime = todatetime('{{EndTimeISO}}');
+            let lookback = starttime - 14d;
+            let failureThreshold = 15;
+            let percentageChangeThreshold = 50;
+            SigninLogs
+            | where TimeGenerated >= lookback
+            | summarize dcount(UserPrincipalName) by bin(TimeGenerated, 1h)
+            | extend hour = datetime_part("Hour",TimeGenerated)
+            | extend day = dayofweek(TimeGenerated)
+            | where day != 6d and day != 7d
+            | order by TimeGenerated asc
+            | summarize make_list(dcount_UserPrincipalName), make_list(TimeGenerated), avg(dcount_UserPrincipalName), make_list(day) by hour
+            | extend series_decompose_anomalies(list_dcount_UserPrincipalName)
+            | mv-expand list_dcount_UserPrincipalName, series_decompose_anomalies_list_dcount_UserPrincipalName_ad_flag, list_TimeGenerated, list_day
+            | where series_decompose_anomalies_list_dcount_UserPrincipalName_ad_flag == 1
+            | project TimeGenerated=todatetime(list_TimeGenerated), Hour=hour, WeekDay=list_day, AccountsAuthenticating=list_dcount_UserPrincipalName, AverageAccountsAuthenticatin=round(avg_dcount_UserPrincipalName, 0), PercentageChange = round  ((list_dcount_UserPrincipalName - avg_dcount_UserPrincipalName) / avg_dcount_UserPrincipalName * 100,   2)
+            | order by PercentageChange desc
+            | join kind=inner(
+                SigninLogs
+                | where TimeGenerated >= lookback
+                | where ResultType == "0"
+                | summarize Success=dcount(UserPrincipalName), SuccessAccounts=make_set(UserPrincipalName) by bin(TimeGenerated, 1h)
+                | join kind=inner(
+                    SigninLogs
+                    | where TimeGenerated >= lookback
+                    | where ResultType in ("50126", "50074", "50057", "51004")
+                    | summarize Failed=dcount(UserPrincipalName), FailedAccounts=make_set(UserPrincipalName) by bin(TimeGenerated, 1h)
+                ) on TimeGenerated
+                | project-away TimeGenerated1
+                | extend Total = Failed + Success
+                | project TimeGenerated, SuccessRate = round((toreal(Success) / toreal(Total)) *100) , round(FailureRate = (toreal(Failed) / toreal(Total)) *100), SuccessAccounts, FailedAccounts
+            ) on TimeGenerated
+            | order by PercentageChange
+            | project-away TimeGenerated1
+            | where FailureRate >= failureThreshold and PercentageChange >= percentageChangeThreshold
+            | extend timestamp = TimeGenerated
+      
+      - Name: AgentHuntLowSlowVolatileIPs
+        DisplayName: "AgentHunt - Low & Slow Password Attempts from Volatile IPs"
+        Description: Flags accounts with many failed sign-in attempts from unique, one-time-use IPs over a long period. Good for detecting slow password sprays using residential proxies.
+        Settings:
+          Target: Sentinel
+          TenantId: "<YOUR_TENANT_ID>"
+          SubscriptionId: "<YOUR_SUBSCRIPTION_ID>"
+          ResourceGroupName: "<YOUR_RESOURCE_GROUP_NAME>"
+          WorkspaceName: "<YOUR_WORKSPACE_NAME>"
+          Template: |-
+            let starttime = todatetime('{{StartTimeISO}}');
+            let endtime = todatetime('{{EndTimeISO}}');
+            let timeRange = 365d;
+            let UnsuccessfulLoginCountryThreshold = 5;
+            SigninLogs
+            | where TimeGenerated between(starttime..endtime)
+            | where ResultType has_any("50055","50126")
+            | summarize IPLogins=count(), make_list(TimeGenerated) by IPAddress, Location, UserPrincipalName 
+            | where IPLogins == 1
+            | extend LoginAttemptTime = format_datetime(todatetime(list_TimeGenerated[0]), 'dd-MM-yyyy')
+            | join kind=leftouter (
+                SigninLogs
+                | where TimeGenerated > ago(timeRange)
+                | where ResultType == 0
+                | summarize count() by IPAddress, UserPrincipalNameSuccess=UserPrincipalName
+            ) on $left.IPAddress == $right.IPAddress
+            | where count_ < 2 or isempty(count_)
+            | where UserPrincipalName == UserPrincipalNameSuccess or isempty(UserPrincipalNameSuccess)
+            | mv-expand list_TimeGenerated to typeof(datetime)
+            | summarize IPs=dcount(IPAddress), UnsuccessfulLoginCountryCount=dcount(Location), make_list(IPAddress), make_list(Location), DaysWithAttempts=dcount(LoginAttemptTime), Failures=count(), StartTime=min(list_TimeGenerated), EndTime=max(list_TimeGenerated) by UserPrincipalName
+            | project UserPrincipalName, StartTime, EndTime, Failures, IPs, UnsuccessfulLoginCountryCount, DaysWithAttempts, IPAddresses=list_IPAddress, IPAddressLocations=list_Location
+            | join kind=leftouter (
+                SigninLogs
+                | where TimeGenerated > ago(timeRange)
+                | where ResultType == 0
+                | extend Location = iff(isempty(Location), "NODATA", Location)
+                | summarize SuccessfulLoginCountries=make_set(Location), SuccessfulLoginCountryCount=dcount(Location) by UserPrincipalName
+            ) on $left.UserPrincipalName == $right.UserPrincipalName
+            | project-away UserPrincipalName1
+            | order by UnsuccessfulLoginCountryCount desc
+            | extend IPIncreaseOnSuccess = UnsuccessfulLoginCountryCount - SuccessfulLoginCountryCount
+            | where UnsuccessfulLoginCountryCount > UnsuccessfulLoginCountryThreshold
+            | project StartTime, EndTime, UserPrincipalName, Failures, IPs, DaysWithAttempts, UnsuccessfulLoginCountryCount, UnuccessfulLoginCountries=IPAddressLocations, SuccessfulLoginCountries, FailureIPAddresses=IPAddresses
+            | extend timestamp = StartTime, AccountCustomEntity = UserPrincipalName, IPCustomEntity = FailureIPAddresses
+      
+      - Name: AgentHuntMfaSpamming
+        DisplayName: "AgentHunt - MFA Spamming Detection"
+        Description: Identifies users subjected to MFA fatigue attacks where multiple MFA requests are denied or ignored before eventual success. Default threshold is 10 failures in a 5-minute window.
+        Settings:
+          Target: Sentinel
+          TenantId: "<YOUR_TENANT_ID>"
+          SubscriptionId: "<YOUR_SUBSCRIPTION_ID>"
+          ResourceGroupName: "<YOUR_RESOURCE_GROUP_NAME>"
+          WorkspaceName: "<YOUR_WORKSPACE_NAME>"
+          Template: |-
+            SigninLogs
+            | where ingestion_time() > ago(1d)
+            | extend
+                DeviceDetail = todynamic(DeviceDetail),
+                LocationDetails = todynamic(LocationDetails)
+            | extend
+                OS = tostring(DeviceDetail.operatingSystem),
+                Browser = tostring(DeviceDetail.browser),
+                State = tostring(LocationDetails.state),
+                City = tostring(LocationDetails.city),
+                Region = tostring(LocationDetails.countryOrRegion)
+            | where AuthenticationRequirement == "multiFactorAuthentication"
+            | mv-expand todynamic(AuthenticationDetails)
+            | extend AuthResult = tostring(parse_json(AuthenticationDetails).authenticationStepResultDetail)
+            | summarize FailedAttempts = countif(AuthResult == "MFA denied; user declined the authentication" or AuthResult == "MFA denied; user did not respond to mobile app notification"),
+                        SuccessfulAttempts = countif(AuthResult == "MFA successfully completed"),
+                        InvolvedOS = make_set(OS, 5),
+                        InvolvedBrowser = make_set(Browser),
+                        StartTime = min(TimeGenerated),
+                        EndTime = max(TimeGenerated)
+              by UserPrincipalName, IPAddress, State, City, Region
+            | extend AuthenticationWindow = (EndTime - StartTime)
+            | where FailedAttempts > 10 and AuthenticationWindow <= 5m
+            | extend Name = tostring(split(UserPrincipalName, '@', 0)[0]), UPNSuffix = tostring(split(UserPrincipalName, '@', 1)[0])
+            | extend timestamp = StartTime, AccountCustomEntity = UserPrincipalName, IPCustomEntity = IPAddress
+
+      - Name: AgentHuntBlockedMfaLoginAttempt
+        DisplayName: "AgentHunt - Login Attempt by Blocked MFA User"
+        Description: Identifies login attempts from users blocked due to repeated failed MFA. Joins IdentityInfo and BehaviorAnalytics data for added context and prioritization.
+        Settings:
+          Target: Sentinel
+          TenantId: "<YOUR_TENANT_ID>"
+          SubscriptionId: "<YOUR_SUBSCRIPTION_ID>"
+          ResourceGroupName: "<YOUR_RESOURCE_GROUP_NAME>"
+          WorkspaceName: "<YOUR_WORKSPACE_NAME>"
+          Template: |-
+            let riskScoreCutoff = 20;
+            let starttime = todatetime('{{StartTimeISO}}');
+            let endtime = todatetime('{{EndTimeISO}}');
+            let lookback = starttime - 7d;
+            let isGUID = "[0-9a-z]{8}-[0-9a-z]{4}-[0-9a-z]{4}-[0-9a-z]{4}-[0-9a-z]{12}";
+            let MFABlocked = SigninLogs
+            | where TimeGenerated between(starttime..endtime)
+            | where ResultType != "0"
+            | extend StatusCode = tostring(Status.errorCode), StatusDetails = tostring(Status.additionalDetails), Status = strcat(ResultType, ": ", ResultDescription)
+            | where StatusDetails =~ "MFA denied; user is blocked"
+            | extend Unresolved = iff(Identity matches regex isGUID, true, false);
+            let identityLookup = SigninLogs
+            | where TimeGenerated between(lookback..starttime)
+            | where not(Identity matches regex isGUID)
+            | summarize by UserId, lu_UserDisplayName = UserDisplayName, lu_UserPrincipalName = UserPrincipalName;
+            let unresolvedNames = MFABlocked | where Unresolved == true | join kind= inner (
+              identityLookup
+            ) on UserId
+            | extend UserDisplayName = lu_UserDisplayName, UserPrincipalName = lu_UserPrincipalName
+            | project-away lu_UserDisplayName, lu_UserPrincipalName;
+            let u_MFABlocked = MFABlocked | where Unresolved == false | union unresolvedNames;
+            u_MFABlocked
+            | extend OS = tostring(DeviceDetail.operatingSystem), Browser = tostring(DeviceDetail.browser)
+            | extend FullLocation = strcat(Location,'|', LocationDetails.state, '|', LocationDetails.city)
+            | summarize TimeGenerated = make_list(TimeGenerated), Status = make_list(Status), IPAddresses = make_list(IPAddress), IPAddressCount = dcount(IPAddress),
+                AttemptCount = count() by UserPrincipalName, UserId, UserDisplayName, AppDisplayName, Browser, OS, FullLocation , CorrelationId
+            | mvexpand TimeGenerated, IPAddresses, Status
+            | extend TimeGenerated = todatetime(tostring(TimeGenerated)), IPAddress = tostring(IPAddresses), Status = tostring(Status)
+            | project-away IPAddresses
+            | summarize StartTime = min(TimeGenerated), EndTime = max(TimeGenerated) by UserPrincipalName, UserId, UserDisplayName, Status, IPAddress, IPAddressCount, AppDisplayName, Browser, OS, FullLocation
+            | extend timestamp = StartTime, UserPrincipalName = tolower(UserPrincipalName), Account_0_Name = UserPrincipalName, IP_0_Address = IPAddress
+            | join kind=leftouter (
+                IdentityInfo
+                | summarize LatestReportTime = arg_max(TimeGenerated, *) by AccountUPN
+                | project AccountUPN, Tags, JobTitle, GroupMembership, AssignedRoles, UserType, IsAccountEnabled
+                | summarize
+                    Tags = make_set(Tags, 1000),
+                    GroupMembership = make_set(GroupMembership, 1000),
+                    AssignedRoles = make_set(AssignedRoles, 1000),
+                    UserType = make_set(UserType, 1000),
+                    UserAccountControl = make_set(UserType, 1000)
+                by AccountUPN
+                | extend UserPrincipalName = tolower(AccountUPN)
+            ) on UserPrincipalName
+            | join kind=leftouter (
+                BehaviorAnalytics
+                | where ActivityType in ("FailedLogOn", "LogOn")
+                | where isnotempty(SourceIPAddress)
+                | project UsersInsights, DevicesInsights, ActivityInsights, InvestigationPriority, SourceIPAddress
+                | project-rename IPAddress = SourceIPAddress
+                | summarize
+                    UsersInsights = make_set(UsersInsights, 1000),
+                    DevicesInsights = make_set(DevicesInsights, 1000),
+                    IPInvestigationPriority = sum(InvestigationPriority)
+                by IPAddress
+            ) on IPAddress
+            | extend UEBARiskScore = IPInvestigationPriority
+            | where UEBARiskScore > riskScoreCutoff
+            | sort by UEBARiskScore desc
+
+      - Name: AgentHuntConditionalAccessExpansion
+        DisplayName: "AgentHunt - Sign-in Logs with Expanded Conditional Access Policies"
+        Description: Parses and surfaces detailed Conditional Access policy decisions from SigninLogs for deeper insight into access control enforcement.
+        Settings:
+          Target: Sentinel
+          TenantId: "<YOUR_TENANT_ID>"
+          SubscriptionId: "<YOUR_SUBSCRIPTION_ID>"
+          ResourceGroupName: "<YOUR_RESOURCE_GROUP_NAME>"
+          WorkspaceName: "<YOUR_WORKSPACE_NAME>"
+          Template: |-
+            SigninLogs 
+            | extend OS = DeviceDetail.operatingSystem, Browser = DeviceDetail.browser
+            | extend ConditionalAccessPol0Name = tostring(ConditionalAccessPolicies[0].displayName), ConditionalAccessPol0Result = tostring(ConditionalAccessPolicies[0].result)
+            | extend ConditionalAccessPol1Name = tostring(ConditionalAccessPolicies[1].displayName), ConditionalAccessPol1Result = tostring(ConditionalAccessPolicies[1].result)
+            | extend ConditionalAccessPol2Name = tostring(ConditionalAccessPolicies[2].displayName), ConditionalAccessPol2Result = tostring(ConditionalAccessPolicies[2].result)
+            | extend StatusCode = tostring(Status.errorCode), StatusDetails = tostring(Status.additionalDetails)
+            | extend State = tostring(LocationDetails.state), City = tostring(LocationDetails.city)
+            | extend Date = startofday(TimeGenerated), Hour = datetime_part("Hour", TimeGenerated)
+            | summarize count() by Date, Identity, UserDisplayName, UserPrincipalName, IPAddress, ResultType, ResultDescription, StatusCode, StatusDetails, 
+              ConditionalAccessPol0Name, ConditionalAccessPol0Result, ConditionalAccessPol1Name, ConditionalAccessPol1Result, ConditionalAccessPol2Name, ConditionalAccessPol2Result, 
+              Location, State, City
+            | extend timestamp = Date, AccountCustomEntity = UserPrincipalName, IPCustomEntity = IPAddress
+            | sort by Date
+
+      - Name: AgentHuntSmartLockouts
+        DisplayName: "AgentHunt - Smart Lockouts"
+        Description: Flags accounts locked out by Azure AD smart lockout policies. Useful for identifying potential password spray sources and affected accounts.
+        Settings:
+          Target: Sentinel
+          TenantId: "<YOUR_TENANT_ID>"
+          SubscriptionId: "<YOUR_SUBSCRIPTION_ID>"
+          ResourceGroupName: "<YOUR_RESOURCE_GROUP_NAME>"
+          WorkspaceName: "<YOUR_WORKSPACE_NAME>"
+          Template: |-
+            SigninLogs
+            | where ResultType == 50053
+            | extend AccountCustomEntity = UserPrincipalName, IPCustomEntity = IPAddress
+
+      - Name: AgentHuntFailedSigninSpike
+        DisplayName: "AgentHunt - Spike in Failed Sign-in Events"
+        Description: Detects anomalous spikes in failed sign-in attempts over time using time-series decomposition. Helps surface brute-force or spray indicators.
+        Settings:
+          Target: Sentinel
+          TenantId: "<YOUR_TENANT_ID>"
+          SubscriptionId: "<YOUR_SUBSCRIPTION_ID>"
+          ResourceGroupName: "<YOUR_RESOURCE_GROUP_NAME>"
+          WorkspaceName: "<YOUR_WORKSPACE_NAME>"
+          Template: |-
+            let starttime = todatetime('{{StartTimeISO}}');
+            let endtime = todatetime('{{EndTimeISO}}');
+            let auditLookback = starttime - 14d;
+            let ts_data = (SigninLogs
+            | where TimeGenerated between (auditLookback..endtime)
+            | where ResultType != 0
+            | make-series count() on TimeGenerated step 1h by UserPrincipalName
+            | extend series_decompose(count_)
+            | extend NoLogons = count_);
+            let TimeSeriesAlerts=ts_data
+              | extend (anomalies, score, baseline) = series_decompose_anomalies(count_, 1.5, -1, 'linefit',0, 'ctukey', 0.7)
+              | mv-expand NoLogons to typeof(double), TimeGenerated to typeof(datetime), anomalies to typeof(double),score to typeof(double), baseline to typeof(long)
+              | where anomalies > 0
+              | project UserPrincipalName, TimeGenerated, NoLogons, baseline, anomalies, score;
+            TimeSeriesAlerts
+              | join kind=inner (
+              SigninLogs
+              | where TimeGenerated between (auditLookback..endtime)
+              | summarize ResultTypeCount=count(),ResultTypes=make_set(ResultType), Locations=make_set(Location), Apps=make_set(AppDisplayName), Ips=make_set(IPAddress) by UserPrincipalName, bin(TimeGenerated, 1h)
+              ) on UserPrincipalName, TimeGenerated
+              | summarize AnomolyTimes = make_set(TimeGenerated), Ips = make_set(Ips), Apps = make_set(Apps), sum(anomalies), Locations=make_set(Locations) by UserPrincipalName
+              | sort by sum_anomalies desc
+              | extend timestamp = tostring(AnomolyTimes[0]), AccountCustomEntity = UserPrincipalName
+
+      - Name: AgentHuntSuccessThenFailOtherApp
+        DisplayName: "AgentHunt - Success on One App then Fail on Another (Low App Distribution)"
+        Description: Detects sign-in behavior where a user successfully authenticates to one app, then fails on a different app within 1 minute. Can indicate malicious discovery or lateral movement activity.
+        Settings:
+          Target: Sentinel
+          TenantId: "<YOUR_TENANT_ID>"
+          SubscriptionId: "<YOUR_SUBSCRIPTION_ID>"
+          ResourceGroupName: "<YOUR_RESOURCE_GROUP_NAME>"
+          WorkspaceName: "<YOUR_WORKSPACE_NAME>"
+          Template: |-
+            let logonDiff = 1m;
+            let Success = SigninLogs
+            | where ResultType == "0"
+            | where AppDisplayName !in ("Office 365 Exchange Online", "Skype for Business Online", "Office 365 SharePoint Online")
+            | project SuccessLogonTime = TimeGenerated, UserPrincipalName, IPAddress , SuccessAppDisplayName = AppDisplayName;
+            let Fail = SigninLogs
+            | where ResultType !in ("0", "50140")
+            | where ResultDescription !~ "Other"
+            | where AppDisplayName !in ("Office 365 Exchange Online", "Skype for Business Online", "Office 365 SharePoint Online")
+            | project FailedLogonTime = TimeGenerated, UserPrincipalName, IPAddress , FailedAppDisplayName = AppDisplayName, ResultType, ResultDescription;
+            let InitialDataSet =
+            Success | join kind= inner (
+            Fail
+            ) on UserPrincipalName, IPAddress
+            | where isnotempty(FailedAppDisplayName)
+            | where SuccessLogonTime < FailedLogonTime and FailedLogonTime - SuccessLogonTime <= logonDiff and SuccessAppDisplayName != FailedAppDisplayName;
+            let InitialHits =
+            InitialDataSet
+            | summarize FailedLogonTime = min(FailedLogonTime), SuccessLogonTime = min(SuccessLogonTime)
+            by UserPrincipalName, SuccessAppDisplayName, FailedAppDisplayName, IPAddress, ResultType, ResultDescription;
+            let Distribution =
+            InitialDataSet
+            | summarize count_SuccessAppDisplayName = count() by SuccessAppDisplayName, ResultType
+            | where count_SuccessAppDisplayName <= 5;
+            InitialHits | join (
+               Distribution
+            ) on SuccessAppDisplayName, ResultType
+            | project UserPrincipalName, SuccessLogonTime, IPAddress, SuccessAppDisplayName, FailedLogonTime, FailedAppDisplayName, ResultType, ResultDescription
+            | extend timestamp = SuccessLogonTime, AccountCustomEntity = UserPrincipalName, IPCustomEntity = IPAddress
+
+      - Name: AgentHuntDisabledAcctReconSuccessElsewhere
+        DisplayName: "AgentHunt - Success from IPs That Also Target Disabled Accounts"
+        Description: Detects IPs that attempt sign-ins to disabled accounts (50057) but also successfully sign in to other accounts. Indicates potential reconnaissance or credential stuffing attempts.
+        Settings:
+          Target: Sentinel
+          TenantId: "<YOUR_TENANT_ID>"
+          SubscriptionId: "<YOUR_SUBSCRIPTION_ID>"
+          ResourceGroupName: "<YOUR_RESOURCE_GROUP_NAME>"
+          WorkspaceName: "<YOUR_WORKSPACE_NAME>"
+          Template: |-
+            let threshold = 100;
+            SigninLogs 
+            | where ResultType == "50057" 
+            | where ResultDescription == "User account is disabled. The account has been disabled by an administrator." 
+            | summarize StartTime = min(TimeGenerated), EndTime = max(TimeGenerated), disabledAccountLoginAttempts = count(), 
+              disabledAccountsTargeted = dcount(UserPrincipalName), applicationsTargeted = dcount(AppDisplayName), disabledAccountSet = makeset(UserPrincipalName), 
+              applicationSet = makeset(AppDisplayName) by IPAddress
+            | order by disabledAccountLoginAttempts desc
+            | join kind= leftouter (
+                SigninLogs
+                | where ResultType == 0
+                | summarize successSigninStart = min(TimeGenerated), successSigninEnd = max(TimeGenerated), successfulAccountSigninCount = dcount(UserPrincipalName), successfulAccountSigninSet = makeset(UserPrincipalName, 15) by IPAddress
+                | where successfulAccountSigninCount < threshold
+            ) on IPAddress  
+            | where successfulAccountSigninCount != 0
+            | extend SuccessBeforeFailure = iff(successSigninStart >= StartTime and successSigninEnd <= EndTime, true, false)  
+            | project StartTime, EndTime, IPAddress, disabledAccountLoginAttempts, disabledAccountsTargeted, disabledAccountSet, applicationSet, 
+              successfulAccountSigninCount, successfulAccountSigninSet
+            | order by disabledAccountLoginAttempts
+            | mvexpand successfulAccountSigninSet
+            | extend timestamp = StartTime, IPCustomEntity = IPAddress
+
+      - Name: AgentHuntFailedAzurePortalAttempts
+        DisplayName: "AgentHunt - Failed Azure Portal Access Attempts"
+        Description: Detects sign-in failures to the Azure Portal from users who either entered invalid passwords or do not exist in the tenant.
+        Settings:
+          Target: Sentinel
+          TenantId: "<YOUR_TENANT_ID>"
+          SubscriptionId: "<YOUR_SUBSCRIPTION_ID>"
+          ResourceGroupName: "<YOUR_RESOURCE_GROUP_NAME>"
+          WorkspaceName: "<YOUR_WORKSPACE_NAME>"
+          Template: |-
+            SigninLogs
+            | where AppDisplayName contains "Azure Portal"
+            | where ResultType in ( "50126" , "50020")
+            | extend OS = DeviceDetail.operatingSystem, Browser = DeviceDetail.browser
+            | extend StatusCode = tostring(Status.errorCode), StatusDetails = tostring(Status.additionalDetails)
+            | extend State = tostring(LocationDetails.state), City = tostring(LocationDetails.city)
+            | summarize StartTime = min(TimeGenerated), EndTime = max(TimeGenerated), IPAddresses = makeset(IPAddress), DistinctIPCount = dcount(IPAddress), 
+                makeset(OS), makeset(Browser), makeset(City), AttemptCount = count() 
+              by UserDisplayName, UserPrincipalName, AppDisplayName, ResultType, ResultDescription, StatusCode, StatusDetails, Location, State
+            | extend timestamp = StartTime, AccountCustomEntity = UserPrincipalName
+            | sort by AttemptCount
+
+      - Name: AgentHuntBlockedAccountFollowUpSignins
+        DisplayName: "AgentHunt - Blocked Account with Follow-up Sign-ins"
+        Description: Detects accounts that were blocked or locked out but later had successful sign-ins — useful for tracking potential compromise or policy bypass.
+        Settings:
+          Target: Sentinel
+          TenantId: "<YOUR_TENANT_ID>"
+          SubscriptionId: "<YOUR_SUBSCRIPTION_ID>"
+          ResourceGroupName: "<YOUR_RESOURCE_GROUP_NAME>"
+          WorkspaceName: "<YOUR_WORKSPACE_NAME>"
+          Template: |-
+            let starttime = totimespan('{{StartTimeISO}}');
+            let endtime = totimespan('{{EndTimeISO}}');
+            let lookback = starttime - 7d;
+            let isGUID = "[0-9a-z]{8}-[0-9a-z]{4}-[0-9a-z]{4}-[0-9a-z]{4}-[0-9a-z]{12}";
+            let aadFunc = (tableName:string){
+              table(tableName)
+              | where TimeGenerated between (startofday(ago(starttime))..startofday(ago(endtime)))
+              | where not(Identity matches regex isGUID)
+            };
+            let aadSignin = aadFunc("SigninLogs");
+            let aadNonInt = aadFunc("AADNonInteractiveUserSignInLogs");
+            let blocked_users = 
+              union isfuzzy=true aadSignin, aadNonInt 
+              | where ResultType != "0"
+              | where ResultDescription has_any ("blocked", "locked")  or ResultType in (50053, 50131, 53003, 500121)
+              | summarize FirstBlockedAttempt = min(TimeGenerated), LastBlockedAttempt = max(TimeGenerated) by UserPrincipalName, ResultDescription, ResultType;
+            blocked_users
+            | join kind= inner (
+              union isfuzzy=true aadSignin, aadNonInt
+              | where ResultType == 0
+              | summarize FirstSuccessfulSignin = min(TimeGenerated), LastSuccessfulSignin = max(TimeGenerated), make_set(IPAddress), make_set(ClientAppUsed), make_set(UserAgent), make_set(AppDisplayName) by UserPrincipalName, UserDisplayName
+            ) on UserPrincipalName
+            | where LastSuccessfulSignin > LastBlockedAttempt
+            | extend timestamp = LastSuccessfulSignin, AccountCustomEntity = UserPrincipalName
+
+      - Name: AgentHuntSuccessfulSigninSpikes
+        DisplayName: "AgentHunt - Spike in Successful Sign-ins"
+        Description: Identifies spikes in successful user sign-ins using time series anomaly detection. Useful for spotting compromised accounts with sudden access surges.
+        Settings:
+          Target: Sentinel
+          TenantId: "<YOUR_TENANT_ID>"
+          SubscriptionId: "<YOUR_SUBSCRIPTION_ID>"
+          ResourceGroupName: "<YOUR_RESOURCE_GROUP_NAME>"
+          WorkspaceName: "<YOUR_WORKSPACE_NAME>"
+          Template: |-
+            let starttime = 14d;
+            let timeframe = 1d;
+            let scorethreshold = 5;
+            let baselinethreshold = 25;
+            let aadFunc = (tableName:string){
+              table(tableName)
+              | where TimeGenerated between (startofday(ago(starttime))..startofday(ago(timeframe)))
+              | where ResultType == 0
+              | extend timestamp = TimeGenerated, AccountCustomEntity = UserPrincipalName
+            };
+            let aadSignin = aadFunc("SigninLogs");
+            let aadNonInt = aadFunc("AADNonInteractiveUserSignInLogs");
+            let allSignins = union isfuzzy=true aadSignin, aadNonInt;
+            let TimeSeriesData = union isfuzzy=true aadSignin, aadNonInt 
+              | project TimeGenerated, UserPrincipalName
+              | make-series HourlyCount=count() on TimeGenerated from startofday(ago(starttime)) to startofday(now()) step timeframe by UserPrincipalName
+              | project TimeGenerated, UserPrincipalName, HourlyCount;
+            let TimeSeriesAlerts = TimeSeriesData
+              | extend (anomalies, score, baseline) = series_decompose_anomalies(HourlyCount, scorethreshold, -1, 'linefit')
+              | mv-expand HourlyCount to typeof(double), TimeGenerated to typeof(datetime), anomalies to typeof(double),score to typeof(double), baseline to typeof(long)
+              | where anomalies > 0
+              | extend AnomalyHour = TimeGenerated
+              | where baseline > baselinethreshold
+              | project UserPrincipalName, AnomalyHour, TimeGenerated, HourlyCount, baseline, anomalies, score;
+            let AnomalyHours = TimeSeriesAlerts | where TimeGenerated > ago(2d) | project TimeGenerated;
+            TimeSeriesAlerts
+            | where TimeGenerated > ago(2d)
+            | join kind=inner (
+              union isfuzzy=true aadSignin, aadNonInt
+              | where TimeGenerated > ago(2d)
+              | extend DateHour = bin(TimeGenerated, 1h)
+              | where DateHour in ((AnomalyHours))
+              | summarize HourlyCount=count(), LatestAnomalyTime = arg_max(timestamp,*) by bin(TimeGenerated,1h),  OperationName, Category, ResultType, ResultDescription, UserPrincipalName, UserDisplayName, AppDisplayName, ClientAppUsed, IPAddress, ResourceDisplayName
+            ) on UserPrincipalName
+            | project LatestAnomalyTime, OperationName, Category, UserPrincipalName, UserDisplayName, ResultType, ResultDescription, AppDisplayName, ClientAppUsed, UserAgent, IPAddress, Location, AuthenticationRequirement, ConditionalAccessStatus, ResourceDisplayName, HourlyCount, baseline, anomalies, score
+            | extend timestamp = LatestAnomalyTime, IPCustomEntity = IPAddress, AccountCustomEntity = UserPrincipalName
+
+      - Name: AgentHuntAnomalousAppsByLocation
+        DisplayName: "AgentHunt - Entra ID App Anomalies by Geo"
+        Description: Detects Microsoft Entra ID apps with abnormally high geographic distribution of authentication attempts.
+        Settings:
+          Target: Sentinel
+          TenantId: "<YOUR_TENANT_ID>"
+          SubscriptionId: "<YOUR_SUBSCRIPTION_ID>"
+          ResourceGroupName: "<YOUR_RESOURCE_GROUP_NAME>"
+          WorkspaceName: "<YOUR_WORKSPACE_NAME>"
+          Template: |-
+            let azureSignIns = 
+            SigninLogs
+            | where SourceSystem == "Azure AD"
+            | where OperationName == "Sign-in activity"
+            | project TimeGenerated, OperationName, AppDisplayName , Identity, UserId, UserPrincipalName, Location, LocationDetails, 
+            ClientAppUsed, DeviceDetail, ConditionalAccessPolicies;
+            azureSignIns
+            | extend locationString = strcat(tostring(LocationDetails["countryOrRegion"]), "/", 
+            tostring(LocationDetails["state"]), "/", tostring(LocationDetails["city"]), ";" , tostring(LocationDetails["geoCoordinates"]))
+            | summarize rawSigninCount = count(), countByAccount = dcount(UserId), locationCount = dcount(locationString) by AppDisplayName
+            | where rawSigninCount < 1000
+            | where locationCount > countByAccount
+            | where 1.0 * rawSigninCount / locationCount > 0.8 
+            | order by rawSigninCount desc
+            | join kind = leftouter (
+                azureSignIns 
+              ) on AppDisplayName 
+            | project AppDisplayName, TimeGenerated , Identity, rawSigninCount, countByAccount, locationCount,  
+            locationString = strcat(tostring(LocationDetails["countryOrRegion"]), "/", tostring(LocationDetails["state"]), "/", 
+            tostring(LocationDetails["city"]), ";" , tostring(LocationDetails["geoCoordinates"])), UserPrincipalName
+            | extend timestamp = TimeGenerated, AccountCustomEntity = UserPrincipalName 
+            | order by AppDisplayName, TimeGenerated desc
+
+      - Name: AgentHuntMultipleAdminRemovals
+        DisplayName: "AgentHunt - Multiple Entra ID Admins Removed"
+        Description: Detects when a single user removes 5+ admin roles (like Global Admin) from others within a time window.
+        Settings:
+          Target: Sentinel
+          TenantId: "<YOUR_TENANT_ID>"
+          SubscriptionId: "<YOUR_SUBSCRIPTION_ID>"
+          ResourceGroupName: "<YOUR_RESOURCE_GROUP_NAME>"
+          WorkspaceName: "<YOUR_WORKSPACE_NAME>"
+          Template: |-
+            let removedAccountsThreshold = 5;
+            let starttime = todatetime('{{StartTimeISO}}');
+            let endtime = todatetime('{{EndTimeISO}}');
+            AuditLogs
+            | where TimeGenerated between (starttime .. endtime)
+            | where OperationName in~ ("Remove member from role", "Remove eligible member from role")
+            | where Identity !has "MS-PIM"
+            | extend roleName = trim('"' , tostring(TargetResources[0].modifiedProperties[1].oldValue))
+            | where roleName in~ ("Company Administrator", "Global Administrator")
+            | where TargetResources[0].type =~ "User"
+            | extend Actor = tostring(TargetResources[0].id), removedUserUpn = tostring(TargetResources[0].userPrincipalName)
+            | summarize StartTime = min(TimeGenerated), EndTime = max(TimeGenerated), removedAccounts = dcount(removedUserUpn), removedUserUPN=make_set(removedUserUpn) by Actor
+            | where removedAccounts > removedAccountsThreshold
+            | extend timestamp = StartTime, AccountCustomEntity = Actor
+
+      - Name: AgentHuntRiskySigninDeviceRegistration
+        DisplayName: "AgentHunt - Risky Sign-in Followed by Device Registration"
+        Description: Detects new device registrations occurring shortly after a risky sign-in—potential indicator of persistence techniques.
+        Settings:
+          Target: Sentinel
+          TenantId: "<YOUR_TENANT_ID>"
+          SubscriptionId: "<YOUR_SUBSCRIPTION_ID>"
+          ResourceGroupName: "<YOUR_RESOURCE_GROUP_NAME>"
+          WorkspaceName: "<YOUR_WORKSPACE_NAME>"
+          Template: |-
+            let timeDelta = 6h;
+            let starttime = todatetime('{{StartTimeISO}}');
+            let endtime = todatetime('{{EndTimeISO}}');
+            let registeredDevices=AuditLogs
+            | where TimeGenerated between (starttime .. endtime)
+            | where OperationName =~ "Add registered owner to device" 
+            | where Identity =~ "Device Registration Service" 
+            | extend AccountUpn = tostring(TargetResources[0].userPrincipalName)
+            | extend AccountObjectId = tostring(TargetResources[0].id)
+            | extend DeviceObjectId = trim('"', tostring(TargetResources[0].modifiedProperties[0].newValue))
+            | extend DeviceDisplayName = trim('"', tostring(TargetResources[0].modifiedProperties[1].newValue))
+            | project DeviceRegistrationTimestamp=TimeGenerated,CorrelationId,AccountUpn,AccountObjectId,DeviceObjectId,DeviceDisplayName;
+            let registeringUser= 
+            registeredDevices 
+            | distinct AccountObjectId;
+            let hasRegisteringUser = isnotempty(toscalar(registeringUser));
+            let riskySignins=SigninLogs
+            | where TimeGenerated between ((starttime-timeDelta) .. endtime)
+            | where hasRegisteringUser
+            | where UserId in (registeringUser) 
+            | where RiskLevelDuringSignIn has_any ('medium', 'high')
+            | where AppDisplayName in~ ("Office 365 Exchange Online", "OfficeHome") 
+            | where isnotempty(Id) 
+            | project SignInTimestamp=TimeGenerated, AppDisplayName, CorrelationId, AccountObjectId=UserId, IPAddress, RiskLevelDuringSignIn 
+            | summarize SignInTimestamp=argmin(SignInTimestamp,*) by AppDisplayName, CorrelationId, AccountObjectId, IPAddress, RiskLevelDuringSignIn;
+            registeredDevices 
+            | join riskySignins on AccountObjectId 
+            | where DeviceRegistrationTimestamp - SignInTimestamp < timeDelta
+            | project-away AccountObjectId1
+            | extend timestamp = DeviceRegistrationTimestamp, AccountCustomEntity = AccountUpn, IPCustomEntity = IPAddress
+
+      - Name: AgentHuntSignInBurstGeo
+        DisplayName: "AgentHunt - Sign-in Burst From Multiple Geolocations"
+        Description: Detects Microsoft Entra ID sign-ins from multiple distinct geographic locations within a short period, indicating potential credential compromise.
+        Settings:
+          Target: Sentinel
+          TenantId: "<YOUR_TENANT_ID>"
+          SubscriptionId: "<YOUR_SUBSCRIPTION_ID>"
+          ResourceGroupName: "<YOUR_RESOURCE_GROUP_NAME>"
+          WorkspaceName: "<YOUR_WORKSPACE_NAME>"
+          Template: |-
+            let starttime = todatetime('{{StartTimeISO}}');
+            let endtime = todatetime('{{EndTimeISO}}');
+            let common_locations = (SigninLogs
+              | where TimeGenerated between(starttime..endtime)
+              | extend locationString= strcat(tostring(LocationDetails["countryOrRegion"]), "/", tostring(LocationDetails["state"]))
+              | where locationString != "//"
+              | summarize count() by locationString
+              | take 100
+              | project locationString);
+            let signIns = (SigninLogs
+              | where TimeGenerated between(starttime..endtime)
+              | extend locationString= strcat(tostring(LocationDetails["countryOrRegion"]), "/", tostring(LocationDetails["state"]))
+              | where locationString != "//" and locationString !endswith "/"
+              | where locationString !in (common_locations));
+            let lookupWindow = 10m;
+            let lookupBin = lookupWindow / 2.0;
+            let threshold = 2;
+            let users = (signIns
+              | summarize dcount(locationString) by Identity
+              | where dcount_locationString > threshold
+              | project Identity);
+            signIns
+            | where Identity in (users)
+            | project-rename Start=TimeGenerated
+            | extend TimeKey = bin(Start, lookupBin)
+            | join kind = inner (
+                signIns
+                | project-rename End=TimeGenerated, EndLocationString=locationString
+                | extend TimeKey = range(bin(End - lookupWindow, lookupBin), bin(End, lookupBin), lookupBin)
+                | mvexpand TimeKey to typeof(datetime)
+              ) on Identity, TimeKey
+            | where End > Start
+            | project tostring(Start), tostring(End), locationString, EndLocationString, UserPrincipalName, timeSpan = End - Start, Identity, IPAddress, UserAgent
+            | where locationString != EndLocationString
+            | summarize ips=makeset(IPAddress), UAs=makeset(UserAgent) by timeSpan, Identity, locationString, EndLocationString, Start, End, UserPrincipalName
+            | extend timestamp = Start, AccountCustomEntity = UserPrincipalName

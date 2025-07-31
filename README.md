@@ -41,12 +41,13 @@ Specialized detection for advanced threats in controlled environments:
 - OAuth application credential manipulation
 - Advanced persistent threat (APT) simulation detection
 
-### 🤖 **Automation & Orchestration** (`LogicApp/`)
-Azure Logic App template for automated threat hunting workflows:
-- Security Copilot integration
-- Automated hunting report generation
-- Email notification capabilities
-- Scheduled hunting execution
+### 🤖 **AI-Powered Automation & Reasoning** (`LogicApp/`)
+Azure Logic App template with Security Copilot agent reasoning capabilities:
+- **Automated hunting execution** via Security Copilot plugin skills
+- **AI-powered analysis** - Security Copilot reasons over findings to determine relevance
+- **Intelligent filtering** - Only escalates "interesting" results based on AI assessment
+- **Automated reporting** - Generates concise HTML summaries for security teams
+- **Smart notifications** - Email alerts only when AI determines findings warrant attention
 
 ## 📁 Directory Structure
 
@@ -61,8 +62,8 @@ AgentHunt/
 │   └── MdoQueries                    # 40+ email and XDR hunting skills
 ├── SentinelLabQueries/1D/            # Advanced threat lab detection
 │   └── SentinelTrainingLabQueries.yaml # APT and training environment skills
-├── LogicApp/                         # Automation components
-│   └── template.json                 # Logic App deployment template
+├── LogicApp/                         # AI-powered automation
+│   └── template.json                 # Logic App with Security Copilot reasoning agent
 └── README.md                         # Project documentation
 ```
 
@@ -84,13 +85,19 @@ AgentHunt/
 
 2. **Import Skills**: Load the desired skill categories into your Security Copilot plugin setup.
 
-3. **Deploy Automation** (Optional): Use the Logic App template for automated hunting:
+3. **Deploy AI-Powered Automation** (Optional): Deploy the Logic App with Security Copilot reasoning:
    ```bash
    az deployment group create \
      --resource-group <your-rg> \
      --template-file LogicApp/template.json \
      --parameters notificationEmail=<your-email>
    ```
+   
+   **How it works:**
+   - Runs hunting skills weekly via Security Copilot
+   - AI agent analyzes results and determines if findings are "interesting"
+   - Only sends email reports when AI deems results worth investigating
+   - Generates intelligent HTML summaries of significant findings
 
 4. **Execute Hunts**: Use natural language queries in Security Copilot:
    > "Show me signs of brute force attacks in the last 24 hours"
@@ -126,6 +133,13 @@ AgentHunt/
 - ✅ Credential harvesting patterns
 - ✅ Lateral movement indicators
 
+### AI-Powered Automation
+- ✅ Security Copilot agent reasoning over hunting results
+- ✅ Intelligent filtering of false positives
+- ✅ Automated relevance assessment ("interesting" vs "noise")
+- ✅ Smart escalation and notification workflows
+- ✅ Contextual HTML report generation
+
 ## 🛠️ Customization
 
 Each skill includes configurable parameters for:
@@ -136,18 +150,19 @@ Each skill includes configurable parameters for:
 
 ## 📈 Use Cases
 
-- **SOC Analysts**: Daily threat hunting and incident investigation
-- **Security Engineers**: Proactive threat detection and rule development  
+- **SOC Analysts**: Daily threat hunting with AI-filtered results to reduce noise
+- **Security Engineers**: Proactive threat detection with intelligent automation  
 - **Red Team**: Attack simulation validation and detection testing
 - **Compliance Teams**: Administrative activity monitoring and audit trails
 - **Threat Researchers**: Advanced persistent threat pattern analysis
+- **Security Operations**: Unattended hunting with AI reasoning to surface only relevant findings
 
 ## 🔧 Requirements
 
 - **Microsoft Sentinel** with appropriate pricing tier
 - **Defender for Office 365** with email telemetry ingestion
 - **Azure Activity Logs** enabled and ingested
-- **Security Copilot** with plugin support (for automation features)
+- **Security Copilot** with plugin support and agent reasoning capabilities
 - **Azure Log Analytics Workspace** with sufficient retention
 - **KQL knowledge** for query customization and troubleshooting
 

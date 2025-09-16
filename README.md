@@ -88,4 +88,11 @@ To enable **automated cadence-based hunting**, deploy the Logic App under `Logic
 
 Contributions or suggestions? Open an issue or reach out via GitHub.
 
-© 2025 Robert Moriarty — Built for real-world defenders.
+## Collaborators
+
+Robert Moriarty
+Ron Sanchez
+Boman Tokioka
+Brandy Derogene
+Jean Paul Faria
+

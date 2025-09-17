@@ -1,0 +1,314 @@
+{
+  "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentTemplate.json#",
+  "contentVersion": "1.0.0.0",
+  "parameters": {
+    "workflows_AgentHunt_XdrHunts_name": {
+      "defaultValue": "AgentHunt-XdrHunts",
+      "type": "String",
+      "metadata": {"description":"Logic App name"}
+    },
+    "location": {
+      "defaultValue": "centralus",
+      "type": "String",
+      "metadata": {"description":"Deployment location for the Logic App"}
+    },
+    "subscriptionId": {
+      "defaultValue": "",
+      "type": "String",
+      "metadata": {"description":"Subscription Id used to build managedApi resource ids (optional). Fill if you want the template to pre-populate managedApi ids."}
+    },
+    "connections_securitycopilot_externalid": {
+      "defaultValue": "",
+      "type": "String",
+      "metadata": {"description":"Connection resource id for the securitycopilot connection (example: /subscriptions/.../resourceGroups/.../providers/Microsoft.Web/connections/securitycopilot). Leave empty to supply at deployment time."}
+    },
+    "connections_office365_externalid": {
+      "defaultValue": "",
+      "type": "String",
+      "metadata": {"description":"Connection resource id for the office365 connection (example: /subscriptions/.../resourceGroups/.../providers/Microsoft.Web/connections/office365). Leave empty to supply at deployment time."}
+    },
+    "email_To": {
+      "defaultValue": "",
+      "type": "String",
+      "metadata": {"description":"Email address to send incident reports to. Leave empty to provide at deployment time."}
+    }
+  },
+  "variables": {},
+  "resources": [
+    {
+      "type": "Microsoft.Logic/workflows",
+      "apiVersion": "2017-07-01",
+      "name": "[parameters('workflows_AgentHunt_XdrHunts_name')]",
+      "location": "[parameters('location')]",
+      "properties": {
+        "state": "Enabled",
+        "definition": {
+          "$schema": "https://schema.management.azure.com/providers/Microsoft.Logic/schemas/2016-06-01/workflowdefinition.json#",
+          "contentVersion": "1.0.0.0",
+          "parameters": {
+            "$connections": {
+              "defaultValue": {},
+              "type": "Object"
+            }
+          },
+          "triggers": {
+            "Recurrence": {
+              "recurrence": {
+                "interval": 1,
+                "frequency": "Month"
+              },
+              "type": "Recurrence"
+            }
+          },
+          "actions": {
+            "SC-_Incident_Summary": {
+              "runAfter": {},
+              "type": "ApiConnection",
+              "inputs": {
+                "host": {
+                  "connection": {
+                    "name": "@parameters('$connections')['securitycopilot']['connectionId']"
+                  }
+                },
+                "method": "post",
+                "body": {
+                  "PromptContent": "48",
+                  "SkillName": "GetIncident",
+                  "SkillInputs": 48
+                },
+                "path": "/process-prompt"
+              }
+            },
+            "SC-_Run_AgentHuntProcessInventory": {
+              "runAfter": {
+                "SC-_Incident_Summary": [
+                  "Succeeded"
+                ]
+              },
+              "type": "ApiConnection",
+              "inputs": {
+                "host": {
+                  "connection": {
+                    "name": "@parameters('$connections')['securitycopilot']['connectionId']"
+                  }
+                },
+                "method": "post",
+                "body": {
+                  "PromptContent": "AgentHuntProcessInventory",
+                  "SessionId": "@body('SC-_Incident_Summary')?['sessionId']",
+                  "SkillName": "AgentHuntProcessInventory"
+                },
+                "path": "/process-prompt"
+              }
+            },
+            "SC-_Run_AgentHuntTempStaging": {
+              "runAfter": {
+                "SC-_Run_AgentHuntProcessInventory": [
+                  "Succeeded"
+                ]
+              },
+              "type": "ApiConnection",
+              "inputs": {
+                "host": {
+                  "connection": {
+                    "name": "@parameters('$connections')['securitycopilot']['connectionId']"
+                  }
+                },
+                "method": "post",
+                "body": {
+                  "PromptContent": "AgentHuntTempStaging",
+                  "SessionId": "@body('SC-_Incident_Summary')?['sessionId']",
+                  "SkillName": "AgentHuntTempStaging"
+                },
+                "path": "/process-prompt"
+              }
+            },
+            "SC-_Run_AgentHuntRunKeyAutorun": {
+              "runAfter": {
+                "SC-_Run_AgentHuntTempStaging": [
+                  "Succeeded"
+                ]
+              },
+              "type": "ApiConnection",
+              "inputs": {
+                "host": {
+                  "connection": {
+                    "name": "@parameters('$connections')['securitycopilot']['connectionId']"
+                  }
+                },
+                "method": "post",
+                "body": {
+                  "PromptContent": "AgentHuntRunKeyAutorun",
+                  "SessionId": "@body('SC-_Incident_Summary')?['sessionId']",
+                  "SkillName": "AgentHuntRunKeyAutorun"
+                },
+                "path": "/process-prompt"
+              }
+            },
+            "SC-_Run_AgentHuntRegistryLabWrites": {
+              "runAfter": {
+                "SC-_Run_AgentHuntRunKeyAutorun": [
+                  "Succeeded"
+                ]
+              },
+              "type": "ApiConnection",
+              "inputs": {
+                "host": {
+                  "connection": {
+                    "name": "@parameters('$connections')['securitycopilot']['connectionId']"
+                  }
+                },
+                "method": "post",
+                "body": {
+                  "PromptContent": "AgentHuntRegistryLabWrites",
+                  "SessionId": "@body('SC-_Incident_Summary')?['sessionId']",
+                  "SkillName": "AgentHuntRegistryLabWrites"
+                },
+                "path": "/process-prompt"
+              }
+            },
+            "SC-_Run_AgentHuntNetworkRecon": {
+              "runAfter": {
+                "SC-_Run_AgentHuntRegistryLabWrites": [
+                  "Succeeded"
+                ]
+              },
+              "type": "ApiConnection",
+              "inputs": {
+                "host": {
+                  "connection": {
+                    "name": "@parameters('$connections')['securitycopilot']['connectionId']"
+                  }
+                },
+                "method": "post",
+                "body": {
+                  "PromptContent": "AgentHuntNetworkRecon",
+                  "SessionId": "@body('SC-_Incident_Summary')?['sessionId']",
+                  "SkillName": "AgentHuntNetworkRecon"
+                },
+                "path": "/process-prompt"
+              }
+            },
+            "SC-_Run_AgentHuntTestNetProbes": {
+              "runAfter": {
+                "SC-_Run_AgentHuntNetworkRecon": [
+                  "Succeeded"
+                ]
+              },
+              "type": "ApiConnection",
+              "inputs": {
+                "host": {
+                  "connection": {
+                    "name": "@parameters('$connections')['securitycopilot']['connectionId']"
+                  }
+                },
+                "method": "post",
+                "body": {
+                  "PromptContent": "AgentHuntTestNetProbes",
+                  "SessionId": "@body('SC-_Incident_Summary')?['sessionId']",
+                  "SkillName": "AgentHuntTestNetProbes"
+                },
+                "path": "/process-prompt"
+              }
+            },
+            "SC-_Run_AgentHuntEicarLifecycle": {
+              "runAfter": {
+                "SC-_Run_AgentHuntTestNetProbes": [
+                  "Succeeded"
+                ]
+              },
+              "type": "ApiConnection",
+              "inputs": {
+                "host": {
+                  "connection": {
+                    "name": "@parameters('$connections')['securitycopilot']['connectionId']"
+                  }
+                },
+                "method": "post",
+                "body": {
+                  "PromptContent": "AgentHuntEicarLifecycle",
+                  "SessionId": "@body('SC-_Incident_Summary')?['sessionId']",
+                  "SkillName": "AgentHuntEicarLifecycle"
+                },
+                "path": "/process-prompt"
+              }
+            },
+            "SC-_Build_Report": {
+              "runAfter": {
+                "SC-_Run_AgentHuntEicarLifecycle": [
+                  "Succeeded"
+                ]
+              },
+              "type": "ApiConnection",
+              "inputs": {
+                "host": {
+                  "connection": {
+                    "name": "@parameters('$connections')['securitycopilot']['connectionId']"
+                  }
+                },
+                "method": "post",
+                "body": {
+                  "PromptContent": "/askgpt Using the current session context, generate an HTML-formatted incident report. Review the incident summary and incorporate the results of all subsequent hunting KQL queries. Write from the perspective of a SOC Analyst preparing an initial incident notification. The report should be suitable for sending via email to the security team and must include:\n\nExecutive Summary of the incident\n\nKey findings from hunting queries (clearly attributed to data sources).  Call out if any hunting findings are contextual to the incident summary.  \n\nImpact and scope (affected users, assets, timelines)\n\nRecommended next steps and actions for the SOC team\n\nEnsure the output is in clean, professional HTML formatting that can be directly sent as an email notification",
+                  "SessionId": "@body('SC-_Incident_Summary')?['sessionId']",
+                  "SkillName": "AgentHuntEicarLifecycle"
+                },
+                "path": "/process-prompt"
+              }
+            },
+            "SC-_Build_Report_to_Email": {
+              "runAfter": {
+                "SC-_Build_Report": [
+                  "Succeeded"
+                ]
+              },
+              "type": "ApiConnection",
+              "inputs": {
+                "host": {
+                  "connection": {
+                    "name": "@parameters('$connections')['office365']['connectionId']"
+                  }
+                },
+                "method": "post",
+                "body": {
+                  "To": "[parameters('email_To')]",
+                  "Subject": "Incident Report",
+                  "Body": "@{body('SC-_Build_Report')?['EvaluationResultContent']}",
+                  "Importance": "High"
+                },
+                "path": "/v2/Mail"
+              }
+            },
+            "Terminate": {
+              "runAfter": {
+                "SC-_Build_Report_to_Email": [
+                  "Succeeded"
+                ]
+              },
+              "type": "Terminate",
+              "inputs": {
+                "runStatus": "Succeeded"
+              }
+            }
+          },
+          "outputs": {}
+        },
+        "parameters": {
+          "$connections": {
+            "value": {
+              "securitycopilot": {
+                "id": "[concat('/subscriptions/', parameters('subscriptionId'), '/providers/Microsoft.Web/locations/', parameters('location'), '/managedApis/securitycopilot')]",
+                "connectionId": "[parameters('connections_securitycopilot_externalid')]",
+                "connectionName": "securitycopilot"
+              },
+              "office365": {
+                "id": "[concat('/subscriptions/', parameters('subscriptionId'), '/providers/Microsoft.Web/locations/', parameters('location'), '/managedApis/office365')]",
+                "connectionId": "[parameters('connections_office365_externalid')]",
+                "connectionName": "office365"
+              }
+            }
+          }
+        }
+      }
+    }
+  ]
+}

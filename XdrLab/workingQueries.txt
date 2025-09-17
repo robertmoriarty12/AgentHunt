@@ -1,0 +1,82 @@
+--- 1) PowerShell — stealth / encoded commands ---
+let timeframe = 1h;
+DeviceProcessEvents
+| where Timestamp >= ago(timeframe)
+| where FileName in~ ("powershell.exe", "pwsh.exe")
+| where isnotempty(ProcessCommandLine) and ProcessCommandLine has_any ("-WindowStyle Hidden","-NoProfile","-EncodedCommand","-e ","-nop")
+| project Timestamp, DeviceName, FileName, ProcessCommandLine, InitiatingProcessFileName, InitiatingProcessCommandLine
+| extend timestamp = Timestamp, AccountCustomEntity = "", HostCustomEntity = DeviceName
+| order by Timestamp desc
+
+--- 2) Process inventory — top runners (aggregated) ---
+let timeframe = 1h;
+DeviceProcessEvents
+| where Timestamp >= ago(timeframe)
+| summarize
+    Count = count(),
+    FirstSeen = min(Timestamp),
+    LastSeen = max(Timestamp),
+    SampleCmdLines = make_set(tostring(ProcessCommandLine), 5),
+    SampleInitiators = make_set(tostring(InitiatingProcessFileName), 5)
+  by FileName
+| order by Count desc
+| extend timestamp = FirstSeen, AccountCustomEntity = "", HostCustomEntity = ""
+
+--- 3) Temp staging & opens ---
+let timeframe = 1h;
+DeviceFileEvents
+| where Timestamp >= ago(timeframe)
+| where FolderPath has @"\AppData\Local\Temp" or FolderPath has @"\Temp\"
+| project Timestamp, DeviceName, FileName, FolderPath, ActionType, InitiatingProcessFileName, InitiatingProcessCommandLine
+| extend timestamp = Timestamp, AccountCustomEntity = "", HostCustomEntity = DeviceName
+| order by Timestamp desc
+
+--- 4) Run / RunOnce autorun changes (persistence) ---
+let timeframe = 1h;
+DeviceRegistryEvents
+| where Timestamp >= ago(timeframe)
+| where RegistryKey has @"\Software\Microsoft\Windows\CurrentVersion\Run"
+   or RegistryKey has @"\Software\Microsoft\Windows\CurrentVersion\RunOnce"
+| project Timestamp, DeviceName, RegistryKey, RegistryValueName, RegistryValueData, InitiatingProcessFileName, InitiatingProcessCommandLine
+| extend timestamp = Timestamp, AccountCustomEntity = "", HostCustomEntity = DeviceName
+| order by Timestamp desc
+
+--- 5) LabHarness registry writes (lab-specific keys) ---
+let timeframe = 1h;
+DeviceRegistryEvents
+| where Timestamp >= ago(timeframe)
+| where RegistryKey has "LabHarness" or RegistryValueName has "LabTelemetry" or RegistryValueData has "notepad.exe"
+| project Timestamp, DeviceName, ActionType, RegistryKey, RegistryValueName, RegistryValueData, InitiatingProcessFileName, InitiatingProcessCommandLine
+| extend timestamp = Timestamp, AccountCustomEntity = "", HostCustomEntity = DeviceName
+| order by Timestamp desc
+
+--- 6) DNS + HTTP recon probes (domain list) ---
+let timeframe = 1h;
+DeviceNetworkEvents
+| where Timestamp >= ago(timeframe)
+| where ActionType in ("DnsQuery","HttpConnectionInspected","ConnectionAttempted","ConnectionSuccess")
+| where RemoteUrl has_any ("example.com","badssl.com","iana.org","malware-traffic-analysis.net","msftconnecttest.com")
+| project Timestamp, DeviceName, InitiatingProcessFileName, InitiatingProcessCommandLine, RemoteUrl, RemoteIP, RemotePort, ActionType
+| extend timestamp = Timestamp, AccountCustomEntity = "", HostCustomEntity = DeviceName
+| order by Timestamp desc
+
+--- 7) RFC5737 TEST-NET probes (lab/test IP ranges) ---
+let timeframe = 1h;
+DeviceNetworkEvents
+| where Timestamp >= ago(timeframe)
+| where isnotempty(RemoteIP)
+| where ipv4_is_in_range(RemoteIP, "192.0.2.0/24")
+   or ipv4_is_in_range(RemoteIP, "198.51.100.0/24")
+   or ipv4_is_in_range(RemoteIP, "203.0.113.0/24")
+| project Timestamp, DeviceName, InitiatingProcessFileName, InitiatingProcessCommandLine, RemoteIP, RemotePort, ActionType
+| extend timestamp = Timestamp, AccountCustomEntity = "", HostCustomEntity = DeviceName
+| order by Timestamp desc
+
+--- 8) EICAR file writes & AV lifecycle ---
+let timeframe = 1h;
+DeviceFileEvents
+| where Timestamp >= ago(timeframe)
+| where FileName has "eicar" or FolderPath has "EICARTest" or (FileName has ".com" and FileName has "eicar")
+| project Timestamp, DeviceName, FileName, FolderPath, ActionType, InitiatingProcessFileName, ReportId
+| extend timestamp = Timestamp, AccountCustomEntity = "", HostCustomEntity = DeviceName
+| order by Timestamp desc

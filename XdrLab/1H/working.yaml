@@ -1,0 +1,294 @@
+Descriptor:
+  Name: AgentHunt.SentinelXdrLabQueries
+  DisplayName: AgentHunt - Sentinel XDR Lab Queries
+  Description: A set of KQL skills for lab-focused hunting across process, file, registry,
+    network, scheduled tasks, and AV test artifacts. Each skill includes analyst-friendly
+    context to help Security Copilot reason about results in a test/XDR lab environment.
+SkillGroups:
+- Format: KQL
+  Skills:
+  - Name: AgentHuntPowerShellStealth
+    DisplayName: AgentHunt - PowerShell Stealth & Encoded Commands
+    Description: "Purpose: Detect PowerShell invocations whose *own* command line\
+      \ contains stealth/evasion/automation flags.\nWhy run this: Attackers and red\
+      \ teams frequently launch PowerShell with flags that reduce visibility or enable\
+      \ scripted payloads (examples: \"-WindowStyle Hidden\" to hide a window, \"\
+      -NoProfile\" to bypass user profiles, \"-EncodedCommand\" to hide payload text).\n\
+      When to run: Run anytime you suspect scripted execution, stealthy automation,\
+      \ or when you see unusual process trees referencing PowerShell.\nWhat to expect\
+      \ from the lab harness: Hidden PowerShell child and an encoded-command child\
+      \ created by the harness; you'll see the flags in ProcessCommandLine.\nFalse\
+      \ positives: Legitimate admin tooling, scheduled automation, and management\
+      \ scripts sometimes use -NoProfile or -EncodedCommand. Check parent process\
+      \ and account.\nFollow-ups:\n  - Inspect InitiatingProcessFileName and InitiatingProcessCommandLine\
+      \ to see what launched PowerShell.\n  - Gather process hashes and check signatures\
+      \ or threat intelligence.\n  - If EncodedCommand is present, attempt to decode\
+      \ or collect the command for triage (export process memory or perform live capture).\n"
+    Settings:
+      Target: Sentinel
+      TenantId: fca47690-ab7d-413c-90e4-aafd92aac945
+      SubscriptionId: 311706e5-735a-497d-bb33-10369aea60f7
+      ResourceGroupName: seccopilothunting
+      WorkspaceName: huntingXdr
+      WorkspaceId: f8668906-e772-4499-91e1-6daf7f4dd935
+      Template: 'let timeframe = 1h;
+
+        DeviceProcessEvents
+
+        | where Timestamp >= ago(timeframe)
+
+        | where FileName in~ ("powershell.exe", "pwsh.exe")
+
+        | where isnotempty(ProcessCommandLine) and ProcessCommandLine has_any ("-WindowStyle
+        Hidden","-NoProfile","-EncodedCommand","-e ","-nop")
+
+        | project Timestamp, DeviceName, FileName, ProcessCommandLine, InitiatingProcessFileName,
+        InitiatingProcessCommandLine
+
+        | extend timestamp = Timestamp, AccountCustomEntity = "", HostCustomEntity
+        = DeviceName
+
+        | order by Timestamp desc'
+  - Name: AgentHuntProcessInventory
+    DisplayName: AgentHunt - Process Inventory (Top Runners)
+    Description: 'Purpose: quickly see which executables dominated activity in the
+      timeframe (counts + first/last seen + sample cmd lines/initiators).
+
+      Why run this: Gives a fast prioritized view of what actually ran so you can
+      spot unusual or new binaries without hard-coding names.
+
+      When to run: Good as a first-step after any simulation or suspected compromise
+      to enumerate primary executables that generated telemetry.
+
+      What the lab will show: notepad.exe, mspaint.exe, calc.exe, and powershell.exe
+      near the top.
+
+      '
+    Settings:
+      Target: Sentinel
+      TenantId: fca47690-ab7d-413c-90e4-aafd92aac945
+      SubscriptionId: 311706e5-735a-497d-bb33-10369aea60f7
+      ResourceGroupName: seccopilothunting
+      WorkspaceName: huntingXdr
+      WorkspaceId: f8668906-e772-4499-91e1-6daf7f4dd935
+      Template: "let timeframe = 1h;\nDeviceProcessEvents\n| where Timestamp >= ago(timeframe)\n\
+        | summarize\n    Count = count(),\n    FirstSeen = min(Timestamp),\n    LastSeen\
+        \ = max(Timestamp),\n    SampleCmdLines = make_set(tostring(ProcessCommandLine),\
+        \ 5),\n    SampleInitiators = make_set(tostring(InitiatingProcessFileName),\
+        \ 5)\n  by FileName\n| order by Count desc\n| extend timestamp = FirstSeen,\
+        \ AccountCustomEntity = \"\", HostCustomEntity = \"\""
+  - Name: AgentHuntTempStaging
+    DisplayName: AgentHunt - Temp File Staging & Opens
+    Description: 'Purpose: find files written into user temp folders and the processes
+      that opened them (staging behavior).
+
+      Why run this: Malware and scripts commonly stage payloads or exfil artifacts
+      in temp directories. Correlating writes with process opens exposes staging and
+      immediate usage.
+
+      When to run: Run after detecting new files, process execs, or to validate file-staging
+      behavior in a lab run.
+
+      What the lab will show: GUID-named temp files written by the harness and notepad.exe
+      opening them.
+
+      '
+    Settings:
+      Target: Sentinel
+      TenantId: fca47690-ab7d-413c-90e4-aafd92aac945
+      SubscriptionId: 311706e5-735a-497d-bb33-10369aea60f7
+      ResourceGroupName: seccopilothunting
+      WorkspaceName: huntingXdr
+      WorkspaceId: f8668906-e772-4499-91e1-6daf7f4dd935
+      Template: 'let timeframe = 1h;
+
+        DeviceFileEvents
+
+        | where Timestamp >= ago(timeframe)
+
+        | where FolderPath has @"\AppData\Local\Temp" or FolderPath has @"\Temp\"
+
+        | project Timestamp, DeviceName, FileName, FolderPath, ActionType, InitiatingProcessFileName,
+        InitiatingProcessCommandLine
+
+        | extend timestamp = Timestamp, AccountCustomEntity = "", HostCustomEntity
+        = DeviceName
+
+        | order by Timestamp desc'
+  - Name: AgentHuntRunKeyAutorun
+    DisplayName: AgentHunt - Run/RunOnce Autorun Modifications
+    Description: 'Purpose: detect creation/modification of Run/RunOnce registry values
+      — common persistence vector.
+
+      Why run this: Adversaries create entries here to relaunch components at logon;
+      benign installers also write here so context matters.
+
+      When to run: Run as part of persistence hunts or after seeing process/file events
+      suggesting re-execution (e.g., staged drop + autorun registration).
+
+      What the lab will show: the harness sets a LabTelemetry Run value pointing to
+      notepad.exe (or similar).
+
+      '
+    Settings:
+      Target: Sentinel
+      TenantId: fca47690-ab7d-413c-90e4-aafd92aac945
+      SubscriptionId: 311706e5-735a-497d-bb33-10369aea60f7
+      ResourceGroupName: seccopilothunting
+      WorkspaceName: huntingXdr
+      WorkspaceId: f8668906-e772-4499-91e1-6daf7f4dd935
+      Template: "let timeframe = 1h;\nDeviceRegistryEvents\n| where Timestamp >= ago(timeframe)\n\
+        | where RegistryKey has @\"\\Software\\Microsoft\\Windows\\CurrentVersion\\\
+        Run\"\n   or RegistryKey has @\"\\Software\\Microsoft\\Windows\\CurrentVersion\\\
+        RunOnce\"\n| project Timestamp, DeviceName, RegistryKey, RegistryValueName,\
+        \ RegistryValueData, InitiatingProcessFileName, InitiatingProcessCommandLine\n\
+        | extend timestamp = Timestamp, AccountCustomEntity = \"\", HostCustomEntity\
+        \ = DeviceName\n| order by Timestamp desc"
+  - Name: AgentHuntRegistryLabWrites
+    DisplayName: AgentHunt - LabHarness Registry Writes
+    Description: 'Purpose: surface registry values under HKCU\...\LabHarness or entries
+      referencing LabTelemetry — useful to validate registry telemetry and tie lab
+      noise to keys.
+
+      Why run this: Lab scripts create demonstration keys/values; surfacing these
+      validates registry telemetry and ties lab actions to hunts.
+
+      When to run: Useful immediately after lab runs to confirm registry telemetry
+      collection and to map lab noise to registry events.
+
+      What the lab will show: a write to HKCU\Software\LabHarness\Toggle (GUID) and
+      a Run value entry for LabTelemetry.
+
+      '
+    Settings:
+      Target: Sentinel
+      TenantId: fca47690-ab7d-413c-90e4-aafd92aac945
+      SubscriptionId: 311706e5-735a-497d-bb33-10369aea60f7
+      ResourceGroupName: seccopilothunting
+      WorkspaceName: huntingXdr
+      WorkspaceId: f8668906-e772-4499-91e1-6daf7f4dd935
+      Template: 'let timeframe = 1h;
+
+        DeviceRegistryEvents
+
+        | where Timestamp >= ago(timeframe)
+
+        | where RegistryKey has "LabHarness" or RegistryValueName has "LabTelemetry"
+        or RegistryValueData has "notepad.exe"
+
+        | project Timestamp, DeviceName, ActionType, RegistryKey, RegistryValueName,
+        RegistryValueData, InitiatingProcessFileName, InitiatingProcessCommandLine
+
+        | extend timestamp = Timestamp, AccountCustomEntity = "", HostCustomEntity
+        = DeviceName
+
+        | order by Timestamp desc'
+  - Name: AgentHuntNetworkRecon
+    DisplayName: AgentHunt - DNS & HTTP Recon Probes
+    Description: 'Purpose: find DNS + HTTP probes to demo/test domains (recon / scripted
+      browsing).
+
+      Why run this: Repeated DNS + HTTP to many distinct hosts (especially from non-browser
+      parents) is a signature of discovery or automated recon. Cross-check domains
+      against TI to prioritize.
+
+      When to run: After suspicious process behavior or routinely to surface devices
+      performing unusual outbound recon.
+
+      What the lab will show: DNS & HTTP entries for example.com, badssl.com, iana.org,
+      malware-traffic-analysis.net; msftconnecttest.com may fail to resolve.
+
+      '
+    Settings:
+      Target: Sentinel
+      TenantId: fca47690-ab7d-413c-90e4-aafd92aac945
+      SubscriptionId: 311706e5-735a-497d-bb33-10369aea60f7
+      ResourceGroupName: seccopilothunting
+      WorkspaceName: huntingXdr
+      WorkspaceId: f8668906-e772-4499-91e1-6daf7f4dd935
+      Template: 'let timeframe = 1h;
+
+        DeviceNetworkEvents
+
+        | where Timestamp >= ago(timeframe)
+
+        | where ActionType in ("DnsQuery","HttpConnectionInspected","ConnectionAttempted","ConnectionSuccess")
+
+        | where RemoteUrl has_any ("example.com","badssl.com","iana.org","malware-traffic-analysis.net","msftconnecttest.com")
+
+        | project Timestamp, DeviceName, InitiatingProcessFileName, InitiatingProcessCommandLine,
+        RemoteUrl, RemoteIP, RemotePort, ActionType
+
+        | extend timestamp = Timestamp, AccountCustomEntity = "", HostCustomEntity
+        = DeviceName
+
+        | order by Timestamp desc'
+  - Name: AgentHuntTestNetProbes
+    DisplayName: AgentHunt - RFC5737 TEST-NET Probes
+    Description: 'Purpose: spot outbound TCP/connection probes to TEST-NET addresses
+      (rare in prod, common in labs).
+
+      Why run this: These documentation/test IPs are rarely contacted in production
+      and often indicate scripted lab probes, sandbox checks, or misconfigured tooling
+      using example addresses.
+
+      When to run: When hunting for scripted scanning or to identify lab hosts running
+      synthetic recon tests.
+
+      What the lab will show: connect attempts to 192.0.2.1, 198.51.100.1, 203.0.113.1
+      (usually failed but visible).
+
+      '
+    Settings:
+      Target: Sentinel
+      TenantId: fca47690-ab7d-413c-90e4-aafd92aac945
+      SubscriptionId: 311706e5-735a-497d-bb33-10369aea60f7
+      ResourceGroupName: seccopilothunting
+      WorkspaceName: huntingXdr
+      WorkspaceId: f8668906-e772-4499-91e1-6daf7f4dd935
+      Template: "let timeframe = 1h;\nDeviceNetworkEvents\n| where Timestamp >= ago(timeframe)\n\
+        | where isnotempty(RemoteIP)\n| where ipv4_is_in_range(RemoteIP, \"192.0.2.0/24\"\
+        )\n   or ipv4_is_in_range(RemoteIP, \"198.51.100.0/24\")\n   or ipv4_is_in_range(RemoteIP,\
+        \ \"203.0.113.0/24\")\n| project Timestamp, DeviceName, InitiatingProcessFileName,\
+        \ InitiatingProcessCommandLine, RemoteIP, RemotePort, ActionType\n| extend\
+        \ timestamp = Timestamp, AccountCustomEntity = \"\", HostCustomEntity = DeviceName\n\
+        | order by Timestamp desc"
+  - Name: AgentHuntEicarLifecycle
+    DisplayName: AgentHunt - EICAR File Write & AV Detection Lifecycle
+    Description: 'Purpose: show file writes and process requests related to EICAR
+      test artifacts to validate AV/EDR detection lifecycle (create -> detect -> quarantine/upload).
+
+      Why run this: In lab testing, EICAR validates detection. This query pulls file
+      creation events and associated process attempts and returns ReportId/Alert evidence
+      where available.
+
+      When to run: After a lab harness that writes/executes EICAR or other AV tests.
+      Keep EICAR queries confined to lab contexts.
+
+      What the lab will show: creation of C:\Temp\EICARTest\eicar.com and immediate
+      Defender detection/quarantine events (DeviceFileEvents and DeviceEvents/alerts).
+
+      '
+    Settings:
+      Target: Sentinel
+      TenantId: fca47690-ab7d-413c-90e4-aafd92aac945
+      SubscriptionId: 311706e5-735a-497d-bb33-10369aea60f7
+      ResourceGroupName: seccopilothunting
+      WorkspaceName: huntingXdr
+      WorkspaceId: f8668906-e772-4499-91e1-6daf7f4dd935
+      Template: 'let timeframe = 1h;
+
+        DeviceFileEvents
+
+        | where Timestamp >= ago(timeframe)
+
+        | where FileName has "eicar" or FolderPath has "EICARTest" or (FileName has
+        ".com" and FileName has "eicar")
+
+        | project Timestamp, DeviceName, FileName, FolderPath, ActionType, InitiatingProcessFileName,
+        ReportId
+
+        | extend timestamp = Timestamp, AccountCustomEntity = "", HostCustomEntity
+        = DeviceName
+
+        | order by Timestamp desc'

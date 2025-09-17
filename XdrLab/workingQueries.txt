@@ -80,3 +80,170 @@ DeviceFileEvents
 | project Timestamp, DeviceName, FileName, FolderPath, ActionType, InitiatingProcessFileName, ReportId
 | extend timestamp = Timestamp, AccountCustomEntity = "", HostCustomEntity = DeviceName
 | order by Timestamp desc
+
+// Description:
+// Purpose: Analyze frequency of MITRE ATT&CK techniques detected during simulation to identify attack patterns and technique prevalence.
+// Why run this: Provides insight into which attack techniques are most commonly triggered by your simulation scripts, helping validate detection coverage and identify technique gaps in your testing scenarios.
+// When to run: Post-simulation to assess which techniques were successfully detected and their alert severity distribution. Also useful for baseline measurement of detection capabilities.
+// What to expect from the lab harness: PowerShell execution techniques (T1059.001), persistence techniques (T1547), and potentially process injection or defense evasion techniques depending on your malicious script activities.
+// False positives: legitimate administrative activities that trigger the same techniques; correlate with known simulation timeframes and accounts to filter noise.
+// Follow-ups:
+//  1) For high-frequency techniques, verify if detection rules are appropriately tuned (not too sensitive).
+//  2) For missing expected techniques, investigate whether simulation scripts are executing as intended or if detection gaps exist.
+//  3) Cross-reference with MITRE ATT&CK framework to identify technique categories that need additional testing coverage.
+let window = 2h;
+AlertInfo
+| where TimeGenerated >= ago(window)
+| extend ParsedTechniques = parse_json(AttackTechniques)
+| mv-expand Technique = ParsedTechniques to typeof(string)
+| summarize AlertCount = count() by Technique, Severity
+| order by AlertCount desc
+
+
+// Description:
+// Purpose: Evaluate detection source effectiveness by measuring alert volume, technique diversity, and coverage across different security tools.
+// Why run this: Identifies which detection sources (EDR, network monitoring, cloud security) are providing the most comprehensive threat visibility and which may need tuning or additional configuration.
+// When to run: After simulation activities to assess detection tool performance, or regularly to monitor detection pipeline health and identify blind spots in security tooling.
+// What to expect from the lab harness: Microsoft Defender for Endpoint as primary source with EDR detections, potentially Azure Defender or other integrated sources depending on your environment configuration.
+// False positives: normal operational alerts from legitimate tools; focus on correlation with simulation timeframes and unexpected detection source behavior rather than individual alert volumes.
+// Follow-ups:
+//  1) For detection sources with low technique diversity, investigate configuration issues or missing data connectors.
+//  2) Compare detection source effectiveness against baseline measurements to identify degradation or improvement trends.
+//  3) For underperforming sources, review log ingestion, rule configuration, and integration settings with your SIEM/XDR platform.
+let window = 2h;
+AlertInfo
+| where TimeGenerated >= ago(window)
+| summarize 
+    AlertCount = count(),
+    UniqueCategories = dcount(Category),
+    Techniques = make_set(AttackTechniques)
+  by DetectionSource, ServiceSource
+| order by AlertCount desc
+
+
+// Description:
+// Purpose: Analyze alert evidence to identify key indicators of compromise (IOCs) including malicious IPs, URLs, files, and registry modifications.
+// Why run this: AlertEvidence provides detailed forensic artifacts from security alerts, enabling IOC extraction for threat hunting and incident response activities.
+// When to run: After alerts are generated to extract actionable intelligence, build IOC lists, and understand attack artifacts for further investigation.
+// What to expect from the lab harness: evidence showing localhost connections (127.0.0.1), test URLs, malicious file hashes, registry persistence entries, and process command lines from your simulation scripts.
+// False positives: legitimate software artifacts may appear as evidence; focus on correlation with known malicious indicators and suspicious timing patterns.
+// Follow-ups:
+//  1) Submit file hashes to threat intelligence platforms for reputation analysis.
+//  2) Block malicious IPs/URLs at network security controls if confirmed malicious.
+//  3) Search for additional instances of identified IOCs across the environment using historical data.
+let window = 2h;
+AlertEvidence
+| where TimeGenerated >= ago(window)
+| summarize 
+    FileHashes = make_set_if(SHA256, isnotempty(SHA256)),
+    MaliciousIPs = make_set_if(RemoteIP, isnotempty(RemoteIP)),
+    SuspiciousURLs = make_set_if(RemoteUrl, isnotempty(RemoteUrl)),
+    ProcessCommands = make_set_if(ProcessCommandLine, isnotempty(ProcessCommandLine)),
+    RegistryKeys = make_set_if(RegistryKey, isnotempty(RegistryKey)),
+    AffectedFiles = make_set_if(FileName, isnotempty(FileName)),
+    CompromisedAccounts = make_set_if(AccountName, isnotempty(AccountName)),
+    AffectedDevices = make_set_if(DeviceName, isnotempty(DeviceName))
+  by EntityType, EvidenceRole, Title
+| project EntityType, EvidenceRole, Title, FileHashes, MaliciousIPs, SuspiciousURLs, 
+          ProcessCommands, RegistryKeys, AffectedFiles, CompromisedAccounts, AffectedDevices
+| order by EntityType, EvidenceRole
+
+
+// Description:
+// Purpose: Identify security configuration weaknesses and compliance violations that could be exploited during attacks or indicate system compromise.
+// Why run this: Security configuration assessments reveal attack surface expansion, missing security controls, and potential entry points that attackers might leverage.
+// When to run: Regularly for security posture assessment, or after detecting suspicious activities to understand if configuration weaknesses were exploited.
+// What to expect from the lab harness: non-compliant security configurations that may be intentionally weak for testing purposes, firewall misconfigurations, or disabled security features.
+// False positives: intentional configuration exceptions for business requirements; validate against approved security baselines and exception lists.
+// Follow-ups:
+//  1) Prioritize remediation of high-impact configuration issues that could enable lateral movement or privilege escalation.
+//  2) Correlate configuration weaknesses with detected attacks to understand exploitation vectors.
+//  3) Implement configuration monitoring to detect unauthorized security setting changes.
+let window = 24h;  // Longer window since config assessments may be less frequent
+DeviceTvmSecureConfigurationAssessment
+| where TimeGenerated >= ago(window)
+| where IsCompliant == 0  // Non-compliant configurations
+| summarize 
+    NonComplianceCount = count(),
+    ConfigurationIssues = make_set(strcat(ConfigurationCategory, " - ", ConfigurationSubcategory)),
+    LatestAssessment = max(TimeGenerated)
+  by DeviceName, OSPlatform
+| where NonComplianceCount > 5  // Devices with multiple issues
+| project DeviceName, OSPlatform, NonComplianceCount, ConfigurationIssues, LatestAssessment
+| order by NonComplianceCount desc
+
+
+// Description:
+// Purpose: Monitor system performance anomalies that may indicate malicious activity such as cryptomining, DDoS participation, or resource-intensive malware.
+// Why run this: Performance counters can reveal malicious activities that consume system resources, helping detect cryptocurrency miners, botnet activities, and resource exhaustion attacks.
+// When to run: During or after suspicious activities to identify system impact, or regularly to establish performance baselines and detect anomalies.
+// What to expect from the lab harness: potential CPU spikes during PowerShell execution, network activity increases during domain probing, and disk I/O changes during file operations.
+// False positives: legitimate high-resource applications, system updates, backups, and normal business applications; correlate with known activities and business hours.
+// Follow-ups:
+//  1) Correlate performance spikes with process creation events to identify resource-consuming processes.
+//  2) Investigate sustained high resource usage that may indicate persistent malware or cryptomining.
+//  3) Monitor network performance counters for data exfiltration or C2 communication patterns.
+let window = 2h;
+Perf
+| where TimeGenerated >= ago(window)
+| where ObjectName in ("Processor", "Process", "Network Interface", "LogicalDisk")
+| where CounterName in ("% Processor Time", "% Privileged Time", "Bytes Total/sec", "% Disk Time", "Disk Transfers/sec")
+| where CounterValue > 80  // High utilization threshold
+| summarize 
+    AvgValue = avg(CounterValue),
+    MaxValue = max(CounterValue),
+    SampleCount = count()
+  by Computer, ObjectName, CounterName, InstanceName, bin(TimeGenerated, 5m)
+| where SampleCount > 2  // Multiple high readings
+| project TimeGenerated, Computer, ObjectName, CounterName, InstanceName, AvgValue, MaxValue, SampleCount
+| order by TimeGenerated desc, MaxValue desc
+
+// Description:
+// Purpose: Reconstruct complete attack timelines by correlating security incidents with their associated alerts, techniques, and detection sources to build comprehensive incident narratives.
+// Why run this: Provides end-to-end visibility into multi-stage attacks by aggregating all alerts within incidents, calculating attack duration, and mapping MITRE ATT&CK techniques to understand the full attack sequence and detection coverage.
+// When to run: After security incidents are created (post-simulation or real attacks) to analyze attack progression, validate incident correlation accuracy, and assess detection timeline effectiveness.
+// What to expect from the lab harness: multi-stage incidents showing PowerShell execution, registry persistence, and EICAR detection with calculated attack duration; incidents should aggregate multiple alerts with various techniques like T1059.001, T1547, and detection sources from Defender EDR.
+// False positives: legitimate administrative activities that trigger multiple alerts may appear as incidents; filter by known simulation timeframes and validate attack techniques are actually malicious rather than operational.
+// Follow-ups:
+//  1) For incidents with long attack durations, investigate why detection/response took extended time and identify opportunities to reduce dwell time.
+//  2) Analyze technique sequences to identify common attack patterns and improve detection rule chaining or correlation logic.
+//  3) Cross-reference with baseline incident patterns to identify anomalous attack behaviors or new techniques not seen in previous simulations.
+let window = 2h;
+SecurityIncident
+| where TimeGenerated >= ago(window)
+| extend ParsedAlertIds = parse_json(AlertIds)
+| extend OwnerString = tostring(Owner)  // Simple string conversion
+| mv-expand AlertId = ParsedAlertIds to typeof(string)
+| join kind=leftouter (
+    AlertInfo
+    | where TimeGenerated >= ago(window)
+    | extend ParsedTechniques = parse_json(AttackTechniques)
+    | mv-expand Technique = ParsedTechniques to typeof(string)
+    | project AlertId, AlertTitle = Title, AlertSeverity = Severity, 
+              AlertCategory = Category, DetectionSource, Technique, ServiceSource, AlertTimestamp = TimeGenerated
+) on AlertId
+| summarize 
+    AlertTitles = make_set(AlertTitle),
+    AttackTechniques = make_set(Technique),
+    AlertCategories = make_set(AlertCategory),
+    DetectionSources = make_set(DetectionSource),
+    EarliestAlert = min(AlertTimestamp),
+    LatestAlert = max(AlertTimestamp),
+    AlertCount = count()
+  by IncidentNumber, Title, Severity, Status, Classification, TimeGenerated, OwnerString
+| extend AttackDuration = datetime_diff('minute', LatestAlert, EarliestAlert)
+| project 
+    TimeGenerated,
+    IncidentNumber,
+    Title,
+    Severity,
+    Status,
+    AlertCount,
+    AttackDuration,
+    EarliestAlert,
+    LatestAlert,
+    AttackTechniques,
+    AlertCategories,
+    DetectionSources,
+    OwnerString
+| order by TimeGenerated desc

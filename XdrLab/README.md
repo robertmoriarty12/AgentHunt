@@ -116,6 +116,9 @@ AgentHunt will analyze these events using the custom hunting queries, providing:
 - **Contextual analysis**: Understanding the attack timeline and methodology
 - **Actionable recommendations**: Specific remediation steps
 
+![Incident Response Report and Logic App Flow](./c76c6823-5cf9-4f48-851f-5d9827173f96.png)
+
+
 ## Troubleshooting
 
 ### Common Issues
@@ -161,5 +164,6 @@ For issues or questions related to the XDR Lab:
 - Ensure all prerequisites are met before reporting issues
 
 ---
+
 
 **Note**: This lab environment is for educational and demonstration purposes. Always follow your organization's security policies and procedures when implementing similar solutions in production environments.

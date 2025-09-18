@@ -117,6 +117,7 @@ AgentHunt will analyze these events using the custom hunting queries, providing:
 - **Actionable recommendations**: Specific remediation steps
 
 ![Incident Response Report and Logic App Flow](./succesfulRun.jpg)
+![Incident Response Report and Logic App Flow](./succesfulRun2.jpg)
 
 
 ## Troubleshooting
@@ -167,5 +168,6 @@ For issues or questions related to the XDR Lab:
 
 
 **Note**: This lab environment is for educational and demonstration purposes. Always follow your organization's security policies and procedures when implementing similar solutions in production environments.
+
 
 
